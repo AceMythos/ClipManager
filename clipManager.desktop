@@ -1,0 +1,13 @@
+[Desktop Entry]
+Name=ClipManager
+Comment=Clipboard history with preview in panel
+Type=Application
+Exec=clipManager
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;Clipboard;
+Icon=edit-paste-symbolic
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
