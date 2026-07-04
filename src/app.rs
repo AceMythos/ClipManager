@@ -12,6 +12,8 @@ const MAX_HISTORY: usize = 10000;
 const NOTIFICATION_ID: &str = "41042";
 const PANEL_PREVIEW_CHARS: usize = 14;
 const POPUP_PREVIEW_CHARS: usize = 120;
+const POPUP_WIDTH: f32 = 920.0;
+const POPUP_HEIGHT: f32 = 640.0;
 
 #[derive(Clone)]
 struct HistoryEntry {
@@ -181,8 +183,8 @@ impl cosmic::Application for AppModel {
             .popup_container(
                 widget::container(content)
                     .padding(26)
-                    .width(Length::Fixed(920.0))
-                    .height(Length::Fixed(640.0))
+                    .width(Length::Fixed(POPUP_WIDTH))
+                    .height(Length::Fixed(POPUP_HEIGHT))
                     .style(popup_style),
             )
             .into()
@@ -209,15 +211,15 @@ impl cosmic::Application for AppModel {
                 let mut settings = self.core.applet.get_popup_settings(
                     self.core.main_window_id().unwrap(),
                     new_id,
-                    None,
+                    Some((POPUP_WIDTH as u32, POPUP_HEIGHT as u32)),
                     None,
                     None,
                 );
                 settings.positioner.size_limits = iced::Limits::NONE
-                    .min_width(720.0)
-                    .max_width(960.0)
-                    .min_height(420.0)
-                    .max_height(760.0);
+                    .min_width(POPUP_WIDTH)
+                    .max_width(POPUP_WIDTH)
+                    .min_height(POPUP_HEIGHT)
+                    .max_height(POPUP_HEIGHT);
 
                 return cosmic::iced::platform_specific::shell::commands::popup::get_popup(settings);
             }
