@@ -1,41 +1,31 @@
 # ClipManager
 
-A clipboard history applet for the [COSMIC](https://system76.com/cosmic) desktop environment.
+Clipboard history applet for COSMIC desktop panel.
 
-Built with [libcosmic](https://github.com/pop-os/libcosmic) (Rust).
+## What It Does
 
-## Features
+When you copy something, the panel icon shows a preview. Click it to open a popup with your full clipboard history.
 
-- Clipboard history with up to 10,000 entries
-- Search through clipboard history
-- Pin important items to keep them at the top
-- Private mode to pause history tracking
-- Auto-detect content type (URL, code, color, email, text)
-- Desktop notifications on copy
-- Keyboard-friendly popup UI
+**Popup features:**
+- Search bar to filter entries
+- Click any entry to copy it back
+- Pin items (star icon) to keep them at the top
+- Delete individual entries or clear all
+- Private mode toggle — stops recording new copies
 
-## Dependencies
+**Panel icon** shows a truncated preview of your last copy.
 
-- `wl-paste` / `wl-copy` (from `wl-clipboard`)
-- `notify-send` (for notifications)
-
-## Build & Install
+## Install
 
 ```bash
-# Build release
 cargo build --release
-
-# Install binary
 sudo install -m 755 target/release/clipManager /usr/bin/clipManager
-
-# Install desktop file
 sudo cp clipManager.desktop /usr/share/applications/
 ```
 
-## Add to Panel
+Then add via **COSMIC Settings > Desktop > Panel**.
 
-Open **COSMIC Settings > Desktop > Panel** and add the applet.
+## Requirements
 
-## License
-
-MIT
+- `wl-clipboard` (`wl-paste` / `wl-copy`)
+- `libnotify` (`notify-send`)
