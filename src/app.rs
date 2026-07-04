@@ -8,15 +8,44 @@ use cosmic::{
 use std::collections::VecDeque;
 
 const APP_ID: &str = "com.github.igris.ClipManager";
-const MAX_HISTORY: usize = 50;
+const MAX_HISTORY: usize = 10000;
 const NOTIFICATION_ID: &str = "41042";
 const PANEL_PREVIEW_CHARS: usize = 14;
-const POPUP_PREVIEW_CHARS: usize = 72;
+const POPUP_PREVIEW_CHARS: usize = 120;
 
 #[derive(Clone)]
 struct HistoryEntry {
     text: String,
+    kind: EntryKind,
     copied_at: DateTime<Local>,
+    pinned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Text,
+    Url,
+    Command,
+    Code,
+    Image,
+    File,
+    Color,
+    Email,
+}
+
+impl EntryKind {
+    fn label(self) -> &'static str {
+        match self {
+            EntryKind::Text => "Text",
+            EntryKind::Url => "Link",
+            EntryKind::Command => "Command",
+            EntryKind::Code => "Code",
+            EntryKind::Image => "Image",
+            EntryKind::File => "File",
+            EntryKind::Color => "Color",
+            EntryKind::Email => "Email",
+        }
+    }
 }
 
 pub struct AppModel {
@@ -25,6 +54,7 @@ pub struct AppModel {
     history: VecDeque<HistoryEntry>,
     current: String,
     search: String,
+    private_mode: bool,
 }
 
 impl Default for AppModel {
@@ -35,6 +65,7 @@ impl Default for AppModel {
             history: VecDeque::new(),
             current: String::new(),
             search: String::new(),
+            private_mode: false,
         }
     }
 }
@@ -44,10 +75,12 @@ pub enum Message {
     TogglePopup,
     PopupClosed(iced::window::Id),
     ClipChanged(String),
-    CopyEntry(usize),
+    ActivateEntry(usize),
+    TogglePin(usize),
     DeleteEntry(usize),
     ClearHistory,
     SearchChanged(String),
+    TogglePrivateMode,
 }
 
 impl cosmic::Application for AppModel {
@@ -74,107 +107,85 @@ impl cosmic::Application for AppModel {
 
     fn view(&self) -> Element<'_, Self::Message> {
         let suggested = self.core.applet.suggested_size(false);
-        let (major_padding, minor_padding) = self.core.applet.suggested_padding(false);
-        let (horizontal_padding, vertical_padding) = if self.core.applet.is_horizontal() {
-            (major_padding, minor_padding)
-        } else {
-            (minor_padding, major_padding)
-        };
-
         let icon = widget::icon::from_name("edit-paste-symbolic")
             .size(suggested.1.saturating_sub(4));
-        let preview = panel_preview(&self.current);
-        let row = widget::row::with_children(vec![
-            icon.into(),
-            widget::text::body(preview)
-                .align_y(iced::alignment::Vertical::Center)
-                .into(),
-        ])
-        .spacing(6)
-        .align_y(Alignment::Center);
 
-        widget::button::custom(
-            widget::container(row)
-                .center_y(Length::Fixed(f32::from(suggested.1 + 2 * vertical_padding))),
-        )
-            .padding([0, horizontal_padding])
-            .class(theme::Button::AppletIcon)
+        let preview = widget::text::caption(panel_preview(&self.current)).size(12);
+        let content = widget::column::with_children(vec![icon.into(), preview.into()])
+            .spacing(2)
+            .align_x(Alignment::Center);
+
+        self.core
+            .applet
+            .button_from_element(content, true)
             .on_press(Message::TogglePopup)
             .into()
     }
 
     fn view_window(&self, _id: iced::window::Id) -> Element<'_, Self::Message> {
-        let query = self.search.trim().to_lowercase();
-        let mut list = widget::list::list_column();
+        let filtered_entries = self.filtered_entries();
+        let visible_entries = filtered_entries.iter();
 
-        let search = widget::text_input::search_input("Search clipboard history", &self.search)
+        let search = widget::text_input::text_input("Type here to search...", &self.search)
             .on_input(Message::SearchChanged)
-            .padding(12);
+            .padding([12, 16])
+            .size(14)
+            .width(Length::Fill)
+            .style(theme::TextInput::Search);
 
-        let header = widget::row::with_children(vec![
-            widget::text::heading("Clipboard History").into(),
-            widget::Space::new().width(Length::Fill).into(),
-            widget::button::text("Clear")
-                .on_press(Message::ClearHistory)
-                .into(),
-        ])
-        .align_y(Alignment::Center);
-
-        list = list.add(search);
-        list = list.add(header);
-        list = list.add(widget::divider::horizontal::default());
-
-        let mut visible_entries = 0usize;
-        let mut last_heading = String::new();
-
-        for (index, entry) in self.history.iter().enumerate() {
-            if !query.is_empty() && !entry.text.to_lowercase().contains(&query) {
-                continue;
-            }
-
-            let heading = section_heading(entry.copied_at);
-            if heading != last_heading {
-                list = list.add(widget::text::caption(heading.clone()));
-                last_heading = heading;
-            }
-
-            let text = widget::text::body(entry_preview(&entry.text)).width(Length::Fill);
-            let actions = widget::row::with_children(vec![
-                widget::button::icon(widget::icon::from_name("edit-copy-symbolic").size(16))
-                    .on_press(Message::CopyEntry(index))
-                    .into(),
-                widget::button::icon(widget::icon::from_name("user-trash-symbolic").size(16))
-                    .on_press(Message::DeleteEntry(index))
-                    .into(),
+        let search_bar = widget::container(
+            widget::row::with_children(vec![
+                widget::icon::from_name("system-search-symbolic").size(18).into(),
+                search.into(),
             ])
-            .spacing(4)
-            .align_y(Alignment::Center);
-
-            let row = widget::row::with_children(vec![text.into(), actions.into()])
-                .spacing(12)
-                .align_y(Alignment::Center);
-
-            list = list.add(widget::container(row).padding([8, 4]));
-            visible_entries += 1;
-        }
-
-        if visible_entries == 0 {
-            let empty = if self.search.trim().is_empty() {
-                "Nothing copied yet"
-            } else {
-                "No clipboard entries match this search"
-            };
-            list = list.add(widget::text::body(empty));
-        }
-
-        let content = widget::scrollable(
-            widget::container(list)
-                .padding([12, 16])
-                .width(Length::Fill),
+            .spacing(12)
+            .align_y(Alignment::Center),
         )
-        .height(Length::Shrink);
+        .width(Length::Fill)
+        .padding([8, 12])
+        .style(search_shell_style);
 
-        self.core.applet.popup_container(content).into()
+        let divider = || {
+            widget::container(widget::Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
+                .width(Length::Fill)
+                .style(divider_style)
+                .into()
+        };
+
+        let mut body = vec![
+            search_bar.into(),
+            widget::Space::new().height(Length::Fixed(18.0)).into(),
+            divider(),
+            widget::Space::new().height(Length::Fixed(18.0)).into(),
+        ];
+
+        if filtered_entries.is_empty() {
+            body.push(self.empty_state());
+        } else {
+            for (index, entry) in visible_entries {
+                body.push(self.history_row(entry, *index));
+            }
+        }
+
+        body.push(widget::Space::new().height(Length::Fixed(12.0)).into());
+        body.push(divider());
+        body.push(widget::Space::new().height(Length::Fixed(12.0)).into());
+        body.push(self.footer(filtered_entries.len()));
+
+        let content = widget::scrollable(widget::column::with_children(body).spacing(0))
+            .height(Length::Fill)
+            .width(Length::Fill);
+
+        self.core
+            .applet
+            .popup_container(
+                widget::container(content)
+                    .padding(26)
+                    .width(Length::Fixed(920.0))
+                    .height(Length::Fixed(640.0))
+                    .style(popup_style),
+            )
+            .into()
     }
 
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
@@ -203,10 +214,10 @@ impl cosmic::Application for AppModel {
                     None,
                 );
                 settings.positioner.size_limits = iced::Limits::NONE
-                    .min_width(360.0)
-                    .max_width(520.0)
-                    .min_height(280.0)
-                    .max_height(720.0);
+                    .min_width(720.0)
+                    .max_width(960.0)
+                    .min_height(420.0)
+                    .max_height(760.0);
 
                 return cosmic::iced::platform_specific::shell::commands::popup::get_popup(settings);
             }
@@ -222,53 +233,312 @@ impl cosmic::Application for AppModel {
                 }
 
                 self.current = cleaned.clone();
+
+                if self.private_mode {
+                    return Task::none();
+                }
+
+                let kind = detect_kind(&cleaned);
+                let pinned = self
+                    .history
+                    .iter()
+                    .find(|entry| entry.text == cleaned)
+                    .map(|entry| entry.pinned)
+                    .unwrap_or(false);
+
                 self.history.retain(|entry| entry.text != cleaned);
                 self.history.push_front(HistoryEntry {
                     text: cleaned,
+                    kind,
                     copied_at: Local::now(),
+                    pinned,
                 });
 
                 while self.history.len() > MAX_HISTORY {
                     self.history.pop_back();
                 }
+
                 return notify_task("Copied to clipboard", &entry_preview(&self.current));
             }
-            Message::CopyEntry(i) => {
+            Message::ActivateEntry(i) => {
                 if let Some(entry) = self.history.get(i) {
-                    let entry = entry.text.clone();
+                    let entry_text = entry.text.clone();
                     return Task::perform(
                         async move {
                             let _ = tokio::process::Command::new("wl-copy")
-                                .arg(&entry)
+                                .arg(&entry_text)
                                 .output()
                                 .await;
-                            entry
+                            entry_text
                         },
                         |txt| cosmic::Action::from(Message::ClipChanged(txt)),
                     );
                 }
             }
+            Message::TogglePin(i) => {
+                if let Some(entry) = self.history.get_mut(i) {
+                    entry.pinned = !entry.pinned;
+                }
+            }
             Message::DeleteEntry(i) => {
                 if let Some(removed) = self.history.remove(i) {
-                    if removed.text != self.current {
-                        return Task::none();
+                    if removed.text == self.current {
+                        self.current = self
+                            .history
+                            .front()
+                            .map(|entry| entry.text.clone())
+                            .unwrap_or_default();
                     }
-
-                    self.current = self
-                        .history
-                        .front()
-                        .map(|entry| entry.text.clone())
-                        .unwrap_or_default();
                 }
             }
             Message::ClearHistory => {
                 self.history.clear();
                 self.current.clear();
             }
-            Message::SearchChanged(value) => self.search = value,
+            Message::SearchChanged(value) => {
+                self.search = value;
+            }
+            Message::TogglePrivateMode => {
+                self.private_mode = !self.private_mode;
+            }
         }
 
         Task::none()
+    }
+}
+
+impl AppModel {
+    fn filtered_entries(&self) -> Vec<(usize, &HistoryEntry)> {
+        let query = self.search.trim().to_lowercase();
+        let filtered_entries: Vec<_> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| query.is_empty() || entry.text.to_lowercase().contains(&query))
+            .collect();
+
+        let mut pinned = Vec::new();
+        let mut normal = Vec::new();
+
+        for entry in filtered_entries {
+            if entry.1.pinned {
+                pinned.push(entry);
+            } else {
+                normal.push(entry);
+            }
+        }
+
+        pinned.into_iter().chain(normal).collect()
+    }
+
+    fn empty_state(&self) -> Element<'_, Message> {
+        let (title, caption) = if self.history.is_empty() {
+            ("Nothing copied yet", "Anything you copy will appear here.")
+        } else {
+            ("No results", "Try a different search term.")
+        };
+
+        widget::container(
+            widget::column::with_children(vec![
+                widget::text::body(title).size(18).into(),
+                widget::Space::new().height(Length::Fixed(10.0)).into(),
+                widget::text::caption(caption).size(14).into(),
+            ])
+            .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .padding([18, 0])
+        .style(popup_text_style)
+        .into()
+    }
+
+    fn footer(&self, result_count: usize) -> Element<'_, Message> {
+        let info = widget::text::caption(format!("{} items", result_count))
+            .size(13);
+
+        let private_toggle = widget::row::with_children(vec![
+            widget::text::body("Private mode").size(14).into(),
+            widget::toggler(self.private_mode)
+                .size(30)
+                .on_toggle(|_| Message::TogglePrivateMode)
+                .into(),
+        ])
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        widget::row::with_children(vec![
+            info.into(),
+            widget::Space::new().width(Length::Fill).into(),
+            private_toggle.into(),
+            widget::Space::new().width(Length::Fixed(12.0)).into(),
+            icon_button("user-trash-symbolic").on_press(Message::ClearHistory).into(),
+        ])
+        .align_y(Alignment::Center)
+        .into()
+    }
+
+    fn history_row(&self, entry: &HistoryEntry, index: usize) -> Element<'_, Message> {
+        let marker = widget::text::body(if entry.text == self.current { "•" } else { " " })
+            .size(20)
+            .width(Length::Fixed(18.0));
+
+        let text_column = vec![
+            widget::text::body(entry_preview(&entry.text))
+                .size(14)
+                .width(Length::Fill)
+                .into(),
+            widget::Space::new().height(Length::Fixed(4.0)).into(),
+            widget::text::caption(format!(
+                "{} • {}",
+                entry.kind.label(),
+                time_ago(entry.copied_at)
+            ))
+            .size(11)
+            .into(),
+        ];
+
+        let activate = widget::button::custom(
+            widget::row::with_children(vec![
+                marker.into(),
+                widget::column::with_children(text_column)
+                    .width(Length::Fill)
+                    .spacing(2)
+                    .into(),
+            ])
+            .spacing(12)
+            .align_y(Alignment::Center),
+        )
+        .class(widget::button::ButtonClass::Text)
+        .padding([12, 12])
+        .width(Length::Fill)
+        .class(theme::Button::Custom {
+            active: Box::new(history_button_style),
+            disabled: Box::new(|theme| history_button_style(false, theme)),
+            hovered: Box::new(history_button_style),
+            pressed: Box::new(history_button_style),
+        })
+        .on_press(Message::ActivateEntry(index));
+
+        let favorite_icon = if entry.pinned {
+            "emblem-favorite-symbolic"
+        } else {
+            "starred-symbolic"
+        };
+
+        let actions = widget::row::with_children(vec![
+            icon_button(favorite_icon).on_press(Message::TogglePin(index)).into(),
+            widget::Space::new().width(Length::Fixed(4.0)).into(),
+            icon_button("user-trash-symbolic").on_press(Message::DeleteEntry(index)).into(),
+        ])
+        .align_y(Alignment::Center);
+
+        widget::container(
+            widget::row::with_children(vec![
+                activate.into(),
+                widget::Space::new().width(Length::Fixed(16.0)).into(),
+                actions.into(),
+            ])
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([3, 0])
+        .style(popup_text_style)
+        .into()
+    }
+}
+
+fn icon_button<'a>(icon_name: &'static str) -> widget::Button<'a, Message> {
+    widget::button::custom(widget::icon::from_name(icon_name).size(18))
+        .class(theme::Button::Custom {
+            active: Box::new(icon_button_style),
+            disabled: Box::new(|theme| icon_button_style(false, theme)),
+            hovered: Box::new(icon_button_style),
+            pressed: Box::new(icon_button_style),
+        })
+        .padding([8, 8])
+}
+
+fn popup_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x27, 0x27, 0x27))),
+        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        ..Default::default()
+    }
+}
+
+fn popup_text_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        ..Default::default()
+    }
+}
+
+fn divider_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgba8(
+            0x14,
+            0x11,
+            0x11,
+            0.35,
+        ))),
+        ..Default::default()
+    }
+}
+
+fn search_shell_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2B, 0x2B, 0x2B))),
+        border: iced::Border {
+            radius: 24.0.into(),
+            width: 0.0,
+            color: iced::Color::TRANSPARENT,
+        },
+        ..Default::default()
+    }
+}
+
+fn icon_button_style(focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
+    widget::button::Style {
+        background: focused.then_some(iced::Background::Color(iced::Color::from_rgba8(
+            0xFF,
+            0xFF,
+            0xFF,
+            0.08,
+        ))),
+        border_radius: 12.0.into(),
+        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        icon_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        ..Default::default()
+    }
+}
+
+fn history_button_style(focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
+    widget::button::Style {
+        background: focused.then_some(iced::Background::Color(iced::Color::from_rgba8(
+            0xFF,
+            0xFF,
+            0xFF,
+            0.05,
+        ))),
+        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        icon_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        ..Default::default()
+    }
+}
+
+
+fn detect_kind(text: &str) -> EntryKind {
+    let trimmed = text.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        EntryKind::Url
+    } else if trimmed.contains('\n') || trimmed.contains("fn ") || trimmed.contains("let ") {
+        EntryKind::Code
+    } else if trimmed.starts_with("#") || trimmed.starts_with("rgb") || trimmed.starts_with("hsl") {
+        EntryKind::Color
+    } else if trimmed.contains('@') && trimmed.contains('.') {
+        EntryKind::Email
+    } else {
+        EntryKind::Text
     }
 }
 
@@ -324,24 +594,32 @@ fn panel_preview(text: &str) -> String {
 }
 
 fn entry_preview(text: &str) -> String {
-    truncate_chars(&compact_text(text), POPUP_PREVIEW_CHARS)
-}
-
-fn section_heading(copied_at: DateTime<Local>) -> String {
-    let today = Local::now().date_naive();
-    let entry_day = copied_at.date_naive();
-
-    if entry_day == today {
-        format!("Today • {}", copied_at.format("%A, %b %-d"))
+    let collapsed = compact_text(text).replace('\n', " ");
+    let preview = collapsed.trim();
+    if preview.starts_with("http://") || preview.starts_with("https://") {
+        let trimmed = preview.split('/').take(3).collect::<Vec<_>>().join("/");
+        truncate_chars(&trimmed, POPUP_PREVIEW_CHARS)
     } else {
-        copied_at.format("%A, %b %-d").to_string()
+        truncate_chars(preview, POPUP_PREVIEW_CHARS)
     }
 }
 
-fn notify_task(
-    summary: &'static str,
-    body: &str,
-) -> Task<cosmic::Action<Message>> {
+fn time_ago(copied_at: DateTime<Local>) -> String {
+    let now = Local::now();
+    let duration = now.signed_duration_since(copied_at);
+
+    if duration.num_minutes() < 1 {
+        "just now".to_string()
+    } else if duration.num_minutes() < 60 {
+        format!("{} minutes ago", duration.num_minutes())
+    } else if duration.num_hours() < 24 {
+        format!("{} hours ago", duration.num_hours())
+    } else {
+        format!("{} days ago", duration.num_days())
+    }
+}
+
+fn notify_task(summary: &'static str, body: &str) -> Task<cosmic::Action<Message>> {
     let body = body.to_string();
 
     Task::perform(
