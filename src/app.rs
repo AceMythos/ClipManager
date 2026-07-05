@@ -113,15 +113,17 @@ impl cosmic::Application for AppModel {
             .size(suggested.1.saturating_sub(4));
 
         let preview = widget::text::caption(panel_preview(&self.current)).size(12);
-        let content = widget::column::with_children(vec![icon.into(), preview.into()])
-            .spacing(2)
-            .align_x(Alignment::Center);
+        let content = widget::row::with_children(vec![icon.into(), preview.into()])
+            .spacing(6)
+            .align_y(Alignment::Center);
 
-        self.core
+        let btn = self.core
             .applet
             .button_from_element(content, true)
-            .on_press(Message::TogglePopup)
-            .into()
+            .width(Length::Shrink)
+            .on_press(Message::TogglePopup);
+
+        self.core.applet.autosize_window(btn).into()
     }
 
     fn view_window(&self, _id: iced::window::Id) -> Element<'_, Self::Message> {
