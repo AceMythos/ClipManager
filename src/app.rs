@@ -1,29 +1,31 @@
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Duration, Local};
 use cosmic::{
     app::Core,
     iced::{self, futures::SinkExt, Alignment, Length, Subscription},
     theme,
     widget, Element, Task,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 const APP_ID: &str = "com.github.igris.ClipManager";
 const MAX_HISTORY: usize = 10000;
+const MAX_AGE_HOURS: i64 = 48;
 const NOTIFICATION_ID: &str = "41042";
 const PANEL_PREVIEW_CHARS: usize = 14;
 const POPUP_PREVIEW_CHARS: usize = 120;
 const POPUP_WIDTH: f32 = 920.0;
 const POPUP_HEIGHT: f32 = 640.0;
 
-#[derive(Clone)]
-struct HistoryEntry {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HistoryEntry {
     text: String,
     kind: EntryKind,
     copied_at: DateTime<Local>,
     pinned: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryKind {
     Text,
     Url,
@@ -83,6 +85,7 @@ pub enum Message {
     ClearHistory,
     SearchChanged(String),
     TogglePrivateMode,
+    HistoryLoaded(Vec<HistoryEntry>),
 }
 
 impl cosmic::Application for AppModel {
@@ -100,7 +103,12 @@ impl cosmic::Application for AppModel {
     }
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<cosmic::Action<Self::Message>>) {
-        (Self { core, ..Default::default() }, Task::none())
+        let app = Self { core, ..Default::default() };
+        let task = Task::perform(
+            async { crate::storage::load_history().await },
+            |entries| cosmic::Action::from(Message::HistoryLoaded(entries)),
+        );
+        (app, task)
     }
 
     fn on_close_requested(&self, id: iced::window::Id) -> Option<Message> {
@@ -128,7 +136,6 @@ impl cosmic::Application for AppModel {
 
     fn view_window(&self, _id: iced::window::Id) -> Element<'_, Self::Message> {
         let filtered_entries = self.filtered_entries();
-        let visible_entries = filtered_entries.iter();
 
         let search = widget::text_input::text_input("Type here to search...", &self.search)
             .on_input(Message::SearchChanged)
@@ -156,29 +163,33 @@ impl cosmic::Application for AppModel {
                 .into()
         };
 
-        let mut body = vec![
-            search_bar.into(),
-            widget::Space::new().height(Length::Fixed(18.0)).into(),
-            divider(),
-            widget::Space::new().height(Length::Fixed(18.0)).into(),
-        ];
-
+        let mut history_entries: Vec<Element<'_, Message>> = Vec::new();
         if filtered_entries.is_empty() {
-            body.push(self.empty_state());
+            history_entries.push(self.empty_state());
         } else {
-            for (index, entry) in visible_entries {
-                body.push(self.history_row(entry, *index));
+            for (index, entry) in &filtered_entries {
+                history_entries.push(self.history_row(entry, *index));
             }
         }
 
-        body.push(widget::Space::new().height(Length::Fixed(12.0)).into());
-        body.push(divider());
-        body.push(widget::Space::new().height(Length::Fixed(12.0)).into());
-        body.push(self.footer(filtered_entries.len()));
+        let scrollable = widget::scrollable(
+            widget::column::with_children(history_entries).spacing(0),
+        )
+        .height(Length::Fill)
+        .width(Length::Fill);
 
-        let content = widget::scrollable(widget::column::with_children(body).spacing(0))
-            .height(Length::Fill)
-            .width(Length::Fill);
+        let content = widget::column::with_children(vec![
+            search_bar.into(),
+            widget::Space::new().height(Length::Fixed(18.0)).into(),
+            divider(),
+            widget::Space::new().height(Length::Fixed(8.0)).into(),
+            scrollable.into(),
+            widget::Space::new().height(Length::Fixed(8.0)).into(),
+            divider(),
+            widget::Space::new().height(Length::Fixed(12.0)).into(),
+            self.footer(filtered_entries.len()),
+        ])
+        .spacing(0);
 
         self.core
             .applet
@@ -262,7 +273,24 @@ impl cosmic::Application for AppModel {
                     self.history.pop_back();
                 }
 
-                return notify_task("Copied to clipboard", &entry_preview(&self.current));
+                self.prune_expired();
+
+                let current_text = self.current.clone();
+                let claim_clipboard = Task::perform(
+                    async move {
+                        let _ = tokio::process::Command::new("wl-copy")
+                            .arg(&current_text)
+                            .output()
+                            .await;
+                    },
+                    |_| cosmic::Action::None,
+                );
+
+                return Task::batch(vec![
+                    self.schedule_save(),
+                    notify_task("Copied to clipboard", &entry_preview(&self.current)),
+                    claim_clipboard,
+                ]);
             }
             Message::ActivateEntry(i) => {
                 if let Some(entry) = self.history.get(i) {
@@ -283,6 +311,7 @@ impl cosmic::Application for AppModel {
                 if let Some(entry) = self.history.get_mut(i) {
                     entry.pinned = !entry.pinned;
                 }
+                return self.schedule_save();
             }
             Message::DeleteEntry(i) => {
                 if let Some(removed) = self.history.remove(i) {
@@ -294,16 +323,30 @@ impl cosmic::Application for AppModel {
                             .unwrap_or_default();
                     }
                 }
+                return self.schedule_save();
             }
             Message::ClearHistory => {
                 self.history.clear();
                 self.current.clear();
+                return self.schedule_save();
             }
             Message::SearchChanged(value) => {
                 self.search = value;
             }
             Message::TogglePrivateMode => {
                 self.private_mode = !self.private_mode;
+            }
+            Message::HistoryLoaded(entries) => {
+                self.history = VecDeque::from(entries);
+                let needs_save = self.prune_expired();
+                self.current = self
+                    .history
+                    .front()
+                    .map(|e| e.text.clone())
+                    .unwrap_or_default();
+                if needs_save {
+                    return self.schedule_save();
+                }
             }
         }
 
@@ -312,6 +355,28 @@ impl cosmic::Application for AppModel {
 }
 
 impl AppModel {
+    fn prune_expired(&mut self) -> bool {
+        let cutoff = Local::now() - Duration::hours(MAX_AGE_HOURS);
+        let before = self.history.len();
+        self.history.retain(|entry| entry.pinned || entry.copied_at > cutoff);
+        if self.history.len() != before {
+            if !self.history.front().map(|e| e.text == self.current).unwrap_or(false) {
+                self.current = self.history.front().map(|e| e.text.clone()).unwrap_or_default();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn schedule_save(&self) -> Task<cosmic::Action<Message>> {
+        let entries: Vec<HistoryEntry> = self.history.iter().cloned().collect();
+        Task::perform(
+            async move { crate::storage::save_history(&entries).await },
+            |_| cosmic::Action::None,
+        )
+    }
+
     fn filtered_entries(&self) -> Vec<(usize, &HistoryEntry)> {
         let query = self.search.trim().to_lowercase();
         let filtered_entries: Vec<_> = self

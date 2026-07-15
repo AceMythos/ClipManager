@@ -12,6 +12,7 @@ When you copy something, the panel icon shows a preview. Click it to open a popu
 - Pin items (star icon) to keep them at the top
 - Delete individual entries or clear all
 - Private mode toggle — stops recording new copies
+- Auto-clear: entries older than 48 hours are automatically removed (pinned entries are kept)
 
 **Panel icon** shows a truncated preview of your last copy.
 
