@@ -129,7 +129,13 @@ impl cosmic::Application for AppModel {
             .applet
             .button_from_element(content, true)
             .width(Length::Shrink)
-            .on_press(Message::TogglePopup);
+            .on_press(Message::TogglePopup)
+            .class(theme::Button::Custom {
+                active: Box::new(|_, theme| applet_boundary_style(false, theme)),
+                hovered: Box::new(|_, theme| applet_boundary_style(false, theme)),
+                pressed: Box::new(|_, theme| applet_boundary_style(true, theme)),
+                disabled: Box::new(|theme| applet_boundary_style(false, theme)),
+            });
 
         self.core.applet.autosize_window(btn).into()
     }
@@ -516,6 +522,22 @@ impl AppModel {
     }
 }
 
+fn applet_boundary_style(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
+    let cosmic = theme.cosmic();
+    let bg = cosmic.background(theme.transparent);
+    widget::button::Style {
+        background: Some(iced::Background::Color(
+            if focused { bg.component.hover } else { bg.component.base }.into(),
+        )),
+        border_radius: cosmic.corner_radii.radius_s.into(),
+        border_width: 1.0,
+        border_color: bg.divider.into(),
+        text_color: Some(bg.on.into()),
+        icon_color: Some(bg.on.into()),
+        ..Default::default()
+    }
+}
+
 fn icon_button<'a>(icon_name: &'static str) -> widget::Button<'a, Message> {
     widget::button::custom(widget::icon::from_name(icon_name).size(18))
         .class(theme::Button::Custom {
@@ -529,7 +551,11 @@ fn icon_button<'a>(icon_name: &'static str) -> widget::Button<'a, Message> {
 
 fn popup_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
     let bg = if theme.transparent {
-        iced::Background::Color(iced::Color::from_rgba8(0x27, 0x27, 0x27, 0.85))
+        iced::Background::Gradient(iced::Gradient::Linear(
+            iced::gradient::Linear::new(std::f32::consts::PI)
+                .add_stop(0.0, iced::Color::from_rgba8(0x27, 0x27, 0x27, 0.65))
+                .add_stop(1.0, iced::Color::from_rgba8(0x27, 0x27, 0x27, 0.85)),
+        ))
     } else {
         iced::Background::Color(iced::Color::from_rgb8(0x27, 0x27, 0x27))
     };
@@ -538,8 +564,13 @@ fn popup_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
         text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
         border: iced::Border {
             radius: 12.0.into(),
-            width: 0.0,
-            color: iced::Color::TRANSPARENT,
+            width: 1.0,
+            color: iced::Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.12),
+        },
+        shadow: iced::Shadow {
+            color: iced::Color::from_rgba8(0x00, 0x00, 0x00, 0.40),
+            offset: iced::Vector::new(0.0, 16.0),
+            blur_radius: 40.0,
         },
         ..Default::default()
     }
@@ -566,7 +597,7 @@ fn divider_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
 
 fn search_shell_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
     let bg = if theme.transparent {
-        iced::Background::Color(iced::Color::from_rgba8(0x2B, 0x2B, 0x2B, 0.85))
+        iced::Background::Color(iced::Color::from_rgba8(0x2B, 0x2B, 0x2B, 0.70))
     } else {
         iced::Background::Color(iced::Color::from_rgb8(0x2B, 0x2B, 0x2B))
     };
@@ -574,8 +605,8 @@ fn search_shell_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
         background: Some(bg),
         border: iced::Border {
             radius: 24.0.into(),
-            width: 0.0,
-            color: iced::Color::TRANSPARENT,
+            width: 1.0,
+            color: iced::Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.08),
         },
         ..Default::default()
     }
