@@ -59,6 +59,7 @@ pub struct AppModel {
     current: String,
     search: String,
     private_mode: bool,
+    confirm_clear: bool,
 }
 
 impl Default for AppModel {
@@ -70,6 +71,7 @@ impl Default for AppModel {
             current: String::new(),
             search: String::new(),
             private_mode: false,
+            confirm_clear: false,
         }
     }
 }
@@ -86,6 +88,7 @@ pub enum Message {
     SearchChanged(String),
     TogglePrivateMode,
     HistoryLoaded(Vec<HistoryEntry>),
+    PruneTimer,
 }
 
 impl cosmic::Application for AppModel {
@@ -129,13 +132,7 @@ impl cosmic::Application for AppModel {
             .applet
             .button_from_element(content, true)
             .width(Length::Shrink)
-            .on_press(Message::TogglePopup)
-            .class(theme::Button::Custom {
-                active: Box::new(|_, theme| applet_boundary_style(false, theme)),
-                hovered: Box::new(|_, theme| applet_boundary_style(false, theme)),
-                pressed: Box::new(|_, theme| applet_boundary_style(true, theme)),
-                disabled: Box::new(|theme| applet_boundary_style(false, theme)),
-            });
+            .on_press(Message::TogglePopup);
 
         self.core.applet.autosize_window(btn).into()
     }
@@ -214,7 +211,10 @@ impl cosmic::Application for AppModel {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        clip_sub().map(Message::ClipChanged)
+        Subscription::batch(vec![
+            clip_sub().map(Message::ClipChanged),
+            prune_sub().map(|_| Message::PruneTimer),
+        ])
     }
 
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
@@ -245,6 +245,7 @@ impl cosmic::Application for AppModel {
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
+                    self.confirm_clear = false;
                 }
             }
             Message::ClipChanged(text) => {
@@ -275,11 +276,15 @@ impl cosmic::Application for AppModel {
                     pinned,
                 });
 
-                while self.history.len() > MAX_HISTORY {
-                    self.history.pop_back();
-                }
-
                 self.prune_expired();
+
+                while self.history.len() > MAX_HISTORY {
+                    if let Some(idx) = self.history.iter().rposition(|e| !e.pinned) {
+                        self.history.remove(idx);
+                    } else {
+                        break;
+                    }
+                }
 
                 let current_text = self.current.clone();
                 let claim_clipboard = Task::perform(
@@ -332,12 +337,23 @@ impl cosmic::Application for AppModel {
                 return self.schedule_save();
             }
             Message::ClearHistory => {
-                self.history.clear();
-                self.current.clear();
-                return self.schedule_save();
+                if self.confirm_clear {
+                    self.history.clear();
+                    self.current.clear();
+                    self.confirm_clear = false;
+                    return self.schedule_save();
+                } else {
+                    self.confirm_clear = true;
+                }
+            }
+            Message::PruneTimer => {
+                if self.prune_expired() {
+                    return self.schedule_save();
+                }
             }
             Message::SearchChanged(value) => {
                 self.search = value;
+                self.confirm_clear = false;
             }
             Message::TogglePrivateMode => {
                 self.private_mode = !self.private_mode;
@@ -364,7 +380,16 @@ impl AppModel {
     fn prune_expired(&mut self) -> bool {
         let cutoff = Local::now() - Duration::hours(MAX_AGE_HOURS);
         let before = self.history.len();
+
+        let unpinned_before = self.history.iter().filter(|e| !e.pinned).count();
+        let to_remove = self.history.iter().filter(|e| !e.pinned && e.copied_at <= cutoff).count();
+
+        if unpinned_before > 5 && to_remove as f64 / unpinned_before as f64 > 0.9 {
+            return false;
+        }
+
         self.history.retain(|entry| entry.pinned || entry.copied_at > cutoff);
+
         if self.history.len() != before {
             if !self.history.front().map(|e| e.text == self.current).unwrap_or(false) {
                 self.current = self.history.front().map(|e| e.text.clone()).unwrap_or_default();
@@ -441,12 +466,18 @@ impl AppModel {
         .spacing(8)
         .align_y(Alignment::Center);
 
+        let trash_icon = if self.confirm_clear {
+            "dialog-warning-symbolic"
+        } else {
+            "user-trash-symbolic"
+        };
+
         widget::row::with_children(vec![
             info.into(),
             widget::Space::new().width(Length::Fill).into(),
             private_toggle.into(),
             widget::Space::new().width(Length::Fixed(12.0)).into(),
-            icon_button("user-trash-symbolic").on_press(Message::ClearHistory).into(),
+            icon_button(trash_icon).on_press(Message::ClearHistory).into(),
         ])
         .align_y(Alignment::Center)
         .into()
@@ -519,22 +550,6 @@ impl AppModel {
         .padding([3, 0])
         .style(popup_text_style)
         .into()
-    }
-}
-
-fn applet_boundary_style(focused: bool, theme: &cosmic::Theme) -> widget::button::Style {
-    let cosmic = theme.cosmic();
-    let bg = cosmic.background(theme.transparent);
-    widget::button::Style {
-        background: Some(iced::Background::Color(
-            if focused { bg.component.hover } else { bg.component.base }.into(),
-        )),
-        border_radius: cosmic.corner_radii.radius_s.into(),
-        border_width: 1.0,
-        border_color: bg.divider.into(),
-        text_color: Some(bg.on.into()),
-        icon_color: Some(bg.on.into()),
-        ..Default::default()
     }
 }
 
@@ -681,6 +696,20 @@ fn clip_sub() -> Subscription<String> {
                     }
 
                     tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+                }
+            },
+        )
+    })
+}
+
+fn prune_sub() -> Subscription<()> {
+    Subscription::run(|| {
+        iced::stream::channel(
+            100,
+            |mut out: iced::futures::channel::mpsc::Sender<()>| async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
+                    let _ = out.send(()).await;
                 }
             },
         )

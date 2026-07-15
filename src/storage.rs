@@ -80,8 +80,10 @@ fn save_history_sync(entries: &[HistoryEntry]) {
     let path = data_file();
     let tmp_path = dir.join("history.json.tmp");
 
+    let bak = data_file_bak();
     if let Ok(Some(_)) = try_load_from(&path) {
-        let bak = data_file_bak();
+        let _ = fs::copy(&path, &bak);
+    } else if path.exists() && !bak.exists() {
         let _ = fs::copy(&path, &bak);
     }
 
