@@ -531,6 +531,11 @@ fn popup_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(iced::Background::Color(iced::Color::from_rgb8(0x27, 0x27, 0x27))),
         text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        border: iced::Border {
+            radius: 12.0.into(),
+            width: 0.0,
+            color: iced::Color::TRANSPARENT,
+        },
         ..Default::default()
     }
 }
@@ -545,10 +550,10 @@ fn popup_text_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
 fn divider_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
         background: Some(iced::Background::Color(iced::Color::from_rgba8(
-            0x14,
-            0x11,
-            0x11,
-            0.35,
+            0xFF,
+            0xFF,
+            0xFF,
+            0.08,
         ))),
         ..Default::default()
     }
@@ -587,8 +592,9 @@ fn history_button_style(focused: bool, _theme: &cosmic::Theme) -> widget::button
             0xFF,
             0xFF,
             0xFF,
-            0.05,
+            0.06,
         ))),
+        border_radius: 8.0.into(),
         text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
         icon_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
         ..Default::default()
