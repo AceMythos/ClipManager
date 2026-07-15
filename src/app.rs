@@ -527,9 +527,14 @@ fn icon_button<'a>(icon_name: &'static str) -> widget::Button<'a, Message> {
         .padding([8, 8])
 }
 
-fn popup_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
+fn popup_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
+    let bg = if theme.transparent {
+        iced::Background::Color(iced::Color::from_rgba8(0x27, 0x27, 0x27, 0.85))
+    } else {
+        iced::Background::Color(iced::Color::from_rgb8(0x27, 0x27, 0x27))
+    };
     iced::widget::container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x27, 0x27, 0x27))),
+        background: Some(bg),
         text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
         border: iced::Border {
             radius: 12.0.into(),
@@ -559,9 +564,14 @@ fn divider_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
     }
 }
 
-fn search_shell_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
+fn search_shell_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
+    let bg = if theme.transparent {
+        iced::Background::Color(iced::Color::from_rgba8(0x2B, 0x2B, 0x2B, 0.85))
+    } else {
+        iced::Background::Color(iced::Color::from_rgb8(0x2B, 0x2B, 0x2B))
+    };
     iced::widget::container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgb8(0x2B, 0x2B, 0x2B))),
+        background: Some(bg),
         border: iced::Border {
             radius: 24.0.into(),
             width: 0.0,
