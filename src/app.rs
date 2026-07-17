@@ -384,13 +384,19 @@ impl AppModel {
         let unpinned_before = self.history.iter().filter(|e| !e.pinned).count();
         let to_remove = self.history.iter().filter(|e| !e.pinned && e.copied_at <= cutoff).count();
 
-        if unpinned_before > 5 && to_remove as f64 / unpinned_before as f64 > 0.9 {
+        if unpinned_before > 0 && to_remove as f64 / unpinned_before as f64 > 0.9 {
+            eprintln!(
+                "clipboard-applet: prune skipped — would remove {to_remove}/{unpinned_before} unpinned entries (>{:.0}%), cutoff={cutoff}",
+                0.9 * 100.0,
+            );
             return false;
         }
 
         self.history.retain(|entry| entry.pinned || entry.copied_at > cutoff);
 
-        if self.history.len() != before {
+        let removed = before - self.history.len();
+        if removed > 0 {
+            eprintln!("clipboard-applet: pruned {removed} expired entries (kept {})", self.history.len());
             if !self.history.front().map(|e| e.text == self.current).unwrap_or(false) {
                 self.current = self.history.front().map(|e| e.text.clone()).unwrap_or_default();
             }
