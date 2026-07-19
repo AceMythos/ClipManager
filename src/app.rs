@@ -299,7 +299,7 @@ impl cosmic::Application for AppModel {
 
                 return Task::batch(vec![
                     self.schedule_save(),
-                    notify_task("Copied to clipboard", &entry_preview(&self.current)),
+                    notify_task("Copied to clipboard", &entry_preview(&self.current), "edit-paste-symbolic"),
                     claim_clipboard,
                 ]);
             }
@@ -319,8 +319,21 @@ impl cosmic::Application for AppModel {
                 }
             }
             Message::TogglePin(i) => {
-                if let Some(entry) = self.history.get_mut(i) {
-                    entry.pinned = !entry.pinned;
+                if let Some(entry) = self.history.get(i) {
+                    let new_pinned = !entry.pinned;
+                    let (summary, icon) = if new_pinned {
+                        ("Pinned to clipboard", "cpin-filled-symbolic")
+                    } else {
+                        ("Unpinned from clipboard", "cpin-outline-symbolic")
+                    };
+                    let body = entry_preview(&entry.text);
+                    if let Some(entry) = self.history.get_mut(i) {
+                        entry.pinned = new_pinned;
+                    }
+                    return Task::batch(vec![
+                        self.schedule_save(),
+                        notify_task(summary, &body, icon),
+                    ]);
                 }
                 return self.schedule_save();
             }
@@ -531,14 +544,14 @@ impl AppModel {
         })
         .on_press(Message::ActivateEntry(index));
 
-        let favorite_icon = if entry.pinned {
-            "emblem-favorite-symbolic"
+        let pin_icon = if entry.pinned {
+            "cpin-filled-symbolic"
         } else {
-            "starred-symbolic"
+            "cpin-outline-symbolic"
         };
 
         let actions = widget::row::with_children(vec![
-            icon_button(favorite_icon).on_press(Message::TogglePin(index)).into(),
+            icon_button(pin_icon).on_press(Message::TogglePin(index)).into(),
             widget::Space::new().width(Length::Fixed(4.0)).into(),
             icon_button("user-trash-symbolic").on_press(Message::DeleteEntry(index)).into(),
         ])
@@ -770,7 +783,7 @@ fn time_ago(copied_at: DateTime<Local>) -> String {
     }
 }
 
-fn notify_task(summary: &'static str, body: &str) -> Task<cosmic::Action<Message>> {
+fn notify_task(summary: &'static str, body: &str, icon: &'static str) -> Task<cosmic::Action<Message>> {
     let body = body.to_string();
 
     Task::perform(
@@ -781,7 +794,8 @@ fn notify_task(summary: &'static str, body: &str) -> Task<cosmic::Action<Message
                 .arg("--transient")
                 .arg("--expire-time=1600")
                 .arg("--app-name=Clipboard Applet")
-                .arg("--icon=edit-paste-symbolic")
+                .arg("--icon")
+                .arg(icon)
                 .arg(summary)
                 .arg(body)
                 .output()
