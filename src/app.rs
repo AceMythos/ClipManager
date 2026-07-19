@@ -338,21 +338,26 @@ impl cosmic::Application for AppModel {
                 return self.schedule_save();
             }
             Message::DeleteEntry(i) => {
-                if let Some(removed) = self.history.remove(i) {
-                    if removed.text == self.current {
-                        self.current = self
-                            .history
-                            .front()
-                            .map(|entry| entry.text.clone())
-                            .unwrap_or_default();
+                let is_pinned = self.history.get(i).is_some_and(|e| e.pinned);
+                if !is_pinned {
+                    if let Some(removed) = self.history.remove(i) {
+                        if removed.text == self.current {
+                            self.current = self
+                                .history
+                                .front()
+                                .map(|entry| entry.text.clone())
+                                .unwrap_or_default();
+                        }
                     }
                 }
                 return self.schedule_save();
             }
             Message::ClearHistory => {
                 if self.confirm_clear {
-                    self.history.clear();
-                    self.current.clear();
+                    self.history.retain(|e| e.pinned);
+                    if !self.history.iter().any(|e| e.text == self.current) {
+                        self.current.clear();
+                    }
                     self.confirm_clear = false;
                     return self.schedule_save();
                 } else {
@@ -550,12 +555,15 @@ impl AppModel {
             "cpin-outline-symbolic"
         };
 
-        let actions = widget::row::with_children(vec![
+        let mut action_children: Vec<Element<_>> = vec![
             icon_button(pin_icon).on_press(Message::TogglePin(index)).into(),
-            widget::Space::new().width(Length::Fixed(4.0)).into(),
-            icon_button("user-trash-symbolic").on_press(Message::DeleteEntry(index)).into(),
-        ])
-        .align_y(Alignment::Center);
+        ];
+        if !entry.pinned {
+            action_children.push(widget::Space::new().width(Length::Fixed(4.0)).into());
+            action_children.push(icon_button("user-trash-symbolic").on_press(Message::DeleteEntry(index)).into());
+        }
+        let actions = widget::row::with_children(action_children)
+            .align_y(Alignment::Center);
 
         widget::container(
             widget::row::with_children(vec![
