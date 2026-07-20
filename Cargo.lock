@@ -701,6 +701,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "libcosmic",
+ "memchr",
  "serde",
  "serde_json",
  "tokio",

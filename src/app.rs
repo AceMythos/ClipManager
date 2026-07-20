@@ -156,40 +156,52 @@ impl cosmic::Application for AppModel {
             .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .padding([8, 12])
+        .padding([8, 20])
         .style(search_shell_style);
 
-        let divider = || {
-            widget::container(widget::Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
-                .width(Length::Fill)
-                .style(divider_style)
-                .into()
-        };
-
-        let mut history_entries: Vec<Element<'_, Message>> = Vec::new();
+        let mut list_children: Vec<Element<'_, Message>> = Vec::new();
         if filtered_entries.is_empty() {
-            history_entries.push(self.empty_state());
+            list_children.push(self.empty_state());
         } else {
+            let has_pinned = filtered_entries.iter().any(|(_, e)| e.pinned);
+            let has_normal = filtered_entries.iter().any(|(_, e)| !e.pinned);
+
+            let mut added_pinned = false;
+            let mut added_normal = false;
+
             for (index, entry) in &filtered_entries {
-                history_entries.push(self.history_row(entry, *index));
+                if has_pinned && entry.pinned && !added_pinned {
+                    list_children.push(section_header("    PINNED"));
+                    added_pinned = true;
+                }
+                if has_normal && !entry.pinned && !added_normal {
+                    if added_pinned {
+                        let div = widget::container(
+                            widget::Space::new().width(Length::Fill).height(Length::Fixed(1.0)),
+                        )
+                        .width(Length::Fill)
+                        .padding([0, 12])
+                        .style(divider_style);
+                        list_children.push(div.into());
+                    }
+                    list_children.push(section_header("    RECENT"));
+                    added_normal = true;
+                }
+                list_children.push(self.history_row(entry, *index));
             }
         }
 
         let scrollable = widget::scrollable(
-            widget::column::with_children(history_entries).spacing(0),
+            widget::column::with_children(list_children).spacing(4),
         )
         .height(Length::Fill)
         .width(Length::Fill);
 
         let content = widget::column::with_children(vec![
             search_bar.into(),
-            widget::Space::new().height(Length::Fixed(18.0)).into(),
-            divider(),
-            widget::Space::new().height(Length::Fixed(8.0)).into(),
+            widget::Space::new().height(Length::Fixed(20.0)).into(),
             scrollable.into(),
-            widget::Space::new().height(Length::Fixed(8.0)).into(),
-            divider(),
-            widget::Space::new().height(Length::Fixed(12.0)).into(),
+            widget::Space::new().height(Length::Fixed(16.0)).into(),
             self.footer(filtered_entries.len()),
         ])
         .spacing(0);
@@ -198,7 +210,7 @@ impl cosmic::Application for AppModel {
             .applet
             .popup_container(
                 widget::container(content)
-                    .padding(26)
+                    .padding(24)
                     .width(Length::Fixed(POPUP_WIDTH))
                     .height(Length::Fixed(POPUP_HEIGHT))
                     .style(popup_style),
@@ -240,7 +252,11 @@ impl cosmic::Application for AppModel {
                     .min_height(POPUP_HEIGHT)
                     .max_height(POPUP_HEIGHT);
 
-                return cosmic::iced::platform_specific::shell::commands::popup::get_popup(settings);
+                let mut tasks = vec![
+                    cosmic::iced::platform_specific::shell::commands::popup::get_popup(settings),
+                ];
+                tasks.push(iced::window::enable_blur(new_id));
+                return Task::batch(tasks);
             }
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
@@ -462,16 +478,38 @@ impl AppModel {
             ("No results", "Try a different search term.")
         };
 
+        let icon = widget::icon::from_name("edit-paste-symbolic").size(48);
+        let icon_container = widget::container(icon)
+            .width(72)
+            .height(72)
+            .style(|theme| {
+                let cosmic = theme.cosmic();
+                let base: iced::Color = cosmic.background(false).base.into();
+                let divider: iced::Color = cosmic.background(false).divider.into();
+                iced::widget::container::Style {
+                    background: Some(iced::Background::Color(iced::Color { a: 0.08, ..base })),
+                    border: iced::Border {
+                        radius: 20.0.into(),
+                        width: 0.5,
+                        color: divider,
+                    },
+                    ..Default::default()
+                }
+            });
+
         widget::container(
             widget::column::with_children(vec![
+                icon_container.into(),
+                widget::Space::new().height(Length::Fixed(16.0)).into(),
                 widget::text::body(title).size(18).into(),
-                widget::Space::new().height(Length::Fixed(10.0)).into(),
+                widget::Space::new().height(Length::Fixed(6.0)).into(),
                 widget::text::caption(caption).size(14).into(),
             ])
-            .width(Length::Fill),
+            .width(Length::Fill)
+            .align_x(Alignment::Center),
         )
         .width(Length::Fill)
-        .padding([18, 0])
+        .padding([40, 0])
         .style(popup_text_style)
         .into()
     }
@@ -496,56 +534,161 @@ impl AppModel {
             "user-trash-symbolic"
         };
 
-        widget::row::with_children(vec![
+        let inner = widget::row::with_children(vec![
             info.into(),
             widget::Space::new().width(Length::Fill).into(),
             private_toggle.into(),
             widget::Space::new().width(Length::Fixed(12.0)).into(),
-            icon_button(trash_icon).on_press(Message::ClearHistory).into(),
+            icon_button(trash_icon, false).on_press(Message::ClearHistory).into(),
         ])
-        .align_y(Alignment::Center)
-        .into()
+        .align_y(Alignment::Center);
+
+        widget::container(inner)
+            .width(Length::Fill)
+            .padding([14, 20])
+            .style(|theme| {
+                let cosmic = theme.cosmic();
+                let base: iced::Color = cosmic.background(false).base.into();
+                let on: iced::Color = cosmic.background(false).on.into();
+                let divider: iced::Color = cosmic.background(false).divider.into();
+                iced::widget::container::Style {
+                    background: Some(iced::Background::Color(iced::Color { a: 0.30, ..base })),
+                    text_color: Some(on),
+                    border: iced::Border {
+                        radius: 20.0.into(),
+                        width: 1.0,
+                        color: divider,
+                    },
+                    shadow: iced::Shadow {
+                        color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.20),
+                        offset: iced::Vector::new(0.0, 4.0),
+                        blur_radius: 12.0,
+                    },
+                    ..Default::default()
+                }
+            })
+            .into()
     }
 
     fn history_row(&self, entry: &HistoryEntry, index: usize) -> Element<'_, Message> {
-        let marker = widget::text::body(if entry.text == self.current { "•" } else { " " })
-            .size(20)
-            .width(Length::Fixed(18.0));
+        let is_active = entry.text == self.current;
 
-        let text_column = vec![
+        let icon_container = {
+            let icon = widget::icon::from_name(entry_icon(entry.kind))
+                .size(18);
+            widget::container(icon)
+                .width(36)
+                .height(36)
+                .style(|theme| {
+                    let cosmic = theme.cosmic();
+                    let base: iced::Color = cosmic.background(false).base.into();
+                    let divider: iced::Color = cosmic.background(false).divider.into();
+                    iced::widget::container::Style {
+                        background: Some(iced::Background::Color(iced::Color { a: 0.10, ..base })),
+                        border: iced::Border {
+                            radius: 12.0.into(),
+                            width: 0.5,
+                            color: divider,
+                        },
+                        ..Default::default()
+                    }
+                })
+                .into()
+        };
+
+        let text_column = widget::column::with_children(vec![
             widget::text::body(entry_preview(&entry.text))
                 .size(14)
                 .width(Length::Fill)
                 .into(),
-            widget::Space::new().height(Length::Fixed(4.0)).into(),
-            widget::text::caption(format!(
-                "{} • {}",
-                entry.kind.label(),
-                time_ago(entry.copied_at)
-            ))
-            .size(11)
+            widget::Space::new().height(Length::Fixed(2.0)).into(),
+            widget::container(
+                widget::row::with_children(vec![
+                    widget::text::caption(entry.kind.label()).size(11).into(),
+                    widget::Space::new().width(Length::Fixed(8.0)).into(),
+                    widget::text::caption(time_ago(entry.copied_at)).size(11).into(),
+                ])
+            )
+            .style(|theme| {
+                let cosmic = theme.cosmic();
+                let on: iced::Color = cosmic.background(false).on.into();
+                iced::widget::container::Style {
+                    text_color: Some(iced::Color { a: 0.50, ..on }),
+                    ..Default::default()
+                }
+            })
             .into(),
-        ];
+        ])
+        .width(Length::Fill)
+        .spacing(2);
 
         let activate = widget::button::custom(
             widget::row::with_children(vec![
-                marker.into(),
-                widget::column::with_children(text_column)
-                    .width(Length::Fill)
-                    .spacing(2)
-                    .into(),
+                icon_container,
+                text_column.into(),
             ])
             .spacing(12)
             .align_y(Alignment::Center),
         )
-        .class(widget::button::ButtonClass::Text)
-        .padding([12, 12])
+        .padding([12, 16])
         .width(Length::Fill)
         .class(theme::Button::Custom {
-            active: Box::new(history_button_style),
-            disabled: Box::new(|theme| history_button_style(false, theme)),
-            hovered: Box::new(history_button_style),
-            pressed: Box::new(history_button_style),
+            active: Box::new(move |focused, theme| {
+                let cosmic = theme.cosmic();
+                let base: iced::Color = cosmic.background(false).base.into();
+                let on: iced::Color = cosmic.background(false).on.into();
+                let opacity = if is_active { 0.22 } else if focused { 0.20 } else { 0.14 };
+                widget::button::Style {
+                    background: Some(iced::Background::Color(iced::Color { a: opacity, ..base })),
+                    border_radius: 18.0.into(),
+                    shadow_offset: iced::Vector::new(0.0, if is_active { 2.0 } else { 1.0 }),
+                    border_width: 0.5,
+                    border_color: iced::Color { a: if is_active { 0.25 } else { 0.12 }, ..base },
+                    text_color: Some(on),
+                    icon_color: Some(on),
+                    ..Default::default()
+                }
+            }),
+            disabled: Box::new(move |theme| {
+                let cosmic = theme.cosmic();
+                let base: iced::Color = cosmic.background(false).base.into();
+                let on: iced::Color = cosmic.background(false).on.into();
+                widget::button::Style {
+                    background: Some(iced::Background::Color(iced::Color { a: 0.14, ..base })),
+                    border_radius: 18.0.into(),
+                    text_color: Some(on),
+                    icon_color: Some(on),
+                    ..Default::default()
+                }
+            }),
+            hovered: Box::new(move |_focused, theme| {
+                let cosmic = theme.cosmic();
+                let base: iced::Color = cosmic.background(false).base.into();
+                let on: iced::Color = cosmic.background(false).on.into();
+                let opacity = if is_active { 0.24 } else { 0.20 };
+                widget::button::Style {
+                    background: Some(iced::Background::Color(iced::Color { a: opacity, ..base })),
+                    border_radius: 18.0.into(),
+                    shadow_offset: iced::Vector::new(0.0, 2.0),
+                    border_width: 0.5,
+                    border_color: iced::Color { a: 0.20, ..base },
+                    text_color: Some(on),
+                    icon_color: Some(on),
+                    ..Default::default()
+                }
+            }),
+            pressed: Box::new(move |_focused, theme| {
+                let cosmic = theme.cosmic();
+                let base: iced::Color = cosmic.background(false).base.into();
+                let on: iced::Color = cosmic.background(false).on.into();
+                widget::button::Style {
+                    background: Some(iced::Background::Color(iced::Color { a: 0.22, ..base })),
+                    border_radius: 18.0.into(),
+                    text_color: Some(on),
+                    icon_color: Some(on),
+                    ..Default::default()
+                }
+            }),
         })
         .on_press(Message::ActivateEntry(index));
 
@@ -556,11 +699,11 @@ impl AppModel {
         };
 
         let mut action_children: Vec<Element<_>> = vec![
-            icon_button(pin_icon).on_press(Message::TogglePin(index)).into(),
+            icon_button(pin_icon, entry.pinned).on_press(Message::TogglePin(index)).into(),
         ];
         if !entry.pinned {
             action_children.push(widget::Space::new().width(Length::Fixed(4.0)).into());
-            action_children.push(icon_button("user-trash-symbolic").on_press(Message::DeleteEntry(index)).into());
+            action_children.push(icon_button("user-trash-symbolic", false).on_press(Message::DeleteEntry(index)).into());
         }
         let actions = widget::row::with_children(action_children)
             .align_y(Alignment::Center);
@@ -568,49 +711,113 @@ impl AppModel {
         widget::container(
             widget::row::with_children(vec![
                 activate.into(),
-                widget::Space::new().width(Length::Fixed(16.0)).into(),
+                widget::Space::new().width(Length::Fixed(8.0)).into(),
                 actions.into(),
             ])
             .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .padding([3, 0])
+        .padding([2, 4])
         .style(popup_text_style)
         .into()
     }
 }
 
-fn icon_button<'a>(icon_name: &'static str) -> widget::Button<'a, Message> {
+fn icon_button<'a>(icon_name: &'static str, pinned: bool) -> widget::Button<'a, Message> {
     widget::button::custom(widget::icon::from_name(icon_name).size(18))
         .class(theme::Button::Custom {
-            active: Box::new(icon_button_style),
-            disabled: Box::new(|theme| icon_button_style(false, theme)),
-            hovered: Box::new(icon_button_style),
-            pressed: Box::new(icon_button_style),
+            active: Box::new(move |focused, theme| glass_icon_style(focused, pinned, theme)),
+            disabled: Box::new(move |theme| glass_icon_style(false, pinned, theme)),
+            hovered: Box::new(move |focused, theme| glass_icon_style(focused, pinned, theme)),
+            pressed: Box::new(move |focused, theme| glass_icon_style(focused, pinned, theme)),
         })
         .padding([8, 8])
 }
 
-fn popup_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
-    let bg = if theme.transparent {
-        iced::Background::Gradient(iced::Gradient::Linear(
-            iced::gradient::Linear::new(std::f32::consts::PI)
-                .add_stop(0.0, iced::Color::from_rgba8(0x27, 0x27, 0x27, 0.65))
-                .add_stop(1.0, iced::Color::from_rgba8(0x27, 0x27, 0x27, 0.85)),
-        ))
+fn glass_icon_style(focused: bool, pinned: bool, theme: &cosmic::Theme) -> widget::button::Style {
+    let cosmic = theme.cosmic();
+    let base: iced::Color = cosmic.background(false).base.into();
+    let on: iced::Color = cosmic.background(false).on.into();
+    let accent: iced::Color = cosmic.accent.base.into();
+    let divider: iced::Color = cosmic.background(false).divider.into();
+
+    let opacity = if pinned {
+        0.28
+    } else if focused {
+        0.24
     } else {
-        iced::Background::Color(iced::Color::from_rgb8(0x27, 0x27, 0x27))
+        0.14
     };
+    widget::button::Style {
+        background: Some(iced::Background::Color(iced::Color { a: opacity, ..base })),
+        border_radius: 12.0.into(),
+        border_width: 0.5,
+        border_color: divider,
+        shadow_offset: iced::Vector::new(0.0, 1.0),
+        text_color: Some(on),
+        icon_color: Some(if pinned { accent } else { on }),
+        ..Default::default()
+    }
+}
+
+fn entry_icon(kind: EntryKind) -> &'static str {
+    match kind {
+        EntryKind::Text => "text-x-generic-symbolic",
+        EntryKind::Url => "web-browser-symbolic",
+        EntryKind::Command => "terminal-symbolic",
+        EntryKind::Code => "text-x-source-symbolic",
+        EntryKind::Image => "image-x-generic-symbolic",
+        EntryKind::File => "text-x-generic-symbolic",
+        EntryKind::Color => "color-select-symbolic",
+        EntryKind::Email => "mail-send-symbolic",
+    }
+}
+
+fn section_header(label: &'static str) -> Element<'static, Message> {
+    widget::container(
+        widget::text::caption(label)
+            .size(11)
+            .width(Length::Fill),
+    )
+    .padding([18, 12, 8, 12])
+    .width(Length::Fill)
+    .style(|theme| {
+        let cosmic = theme.cosmic();
+        let on: iced::Color = cosmic.background(false).on.into();
+        iced::widget::container::Style {
+            text_color: Some(iced::Color { a: 0.40, ..on }),
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+fn popup_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
+    let cosmic = theme.cosmic();
+    let base: iced::Color = cosmic.background(false).base.into();
+    let on: iced::Color = cosmic.background(false).on.into();
+    let divider: iced::Color = cosmic.background(false).divider.into();
+
+    let (top_alpha, bottom_alpha) = if theme.transparent {
+        (0.25, 0.18)
+    } else {
+        (0.88, 0.82)
+    };
+
     iced::widget::container::Style {
-        background: Some(bg),
-        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        background: Some(iced::Background::Gradient(iced::Gradient::Linear(
+            iced::gradient::Linear::new(std::f32::consts::PI)
+                .add_stop(0.0, iced::Color { a: top_alpha, ..base })
+                .add_stop(1.0, iced::Color { a: bottom_alpha, ..base }),
+        ))),
+        text_color: Some(on),
         border: iced::Border {
-            radius: 12.0.into(),
+            radius: 28.0.into(),
             width: 1.0,
-            color: iced::Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.12),
+            color: divider,
         },
         shadow: iced::Shadow {
-            color: iced::Color::from_rgba8(0x00, 0x00, 0x00, 0.40),
+            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.40),
             offset: iced::Vector::new(0.0, 16.0),
             blur_radius: 40.0,
         },
@@ -618,68 +825,38 @@ fn popup_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
     }
 }
 
-fn popup_text_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
+fn popup_text_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
+    let on: iced::Color = theme.cosmic().background(false).on.into();
     iced::widget::container::Style {
-        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        text_color: Some(on),
         ..Default::default()
     }
 }
 
-fn divider_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
+fn divider_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
+    let cosmic = theme.cosmic();
+    let divider: iced::Color = cosmic.background(false).divider.into();
     iced::widget::container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgba8(
-            0xFF,
-            0xFF,
-            0xFF,
-            0.08,
-        ))),
+        background: Some(iced::Background::Color(iced::Color { a: 0.25, ..divider })),
         ..Default::default()
     }
 }
 
 fn search_shell_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
-    let bg = if theme.transparent {
-        iced::Background::Color(iced::Color::from_rgba8(0x2B, 0x2B, 0x2B, 0.70))
-    } else {
-        iced::Background::Color(iced::Color::from_rgb8(0x2B, 0x2B, 0x2B))
-    };
+    let cosmic = theme.cosmic();
+    let base: iced::Color = cosmic.background(false).base.into();
+    let on: iced::Color = cosmic.background(false).on.into();
+    let divider: iced::Color = cosmic.background(false).divider.into();
+
+    let opacity = if theme.transparent { 0.28 } else { 0.85 };
     iced::widget::container::Style {
-        background: Some(bg),
+        background: Some(iced::Background::Color(iced::Color { a: opacity, ..base })),
+        text_color: Some(on),
         border: iced::Border {
             radius: 24.0.into(),
             width: 1.0,
-            color: iced::Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.08),
+            color: divider,
         },
-        ..Default::default()
-    }
-}
-
-fn icon_button_style(focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
-    widget::button::Style {
-        background: focused.then_some(iced::Background::Color(iced::Color::from_rgba8(
-            0xFF,
-            0xFF,
-            0xFF,
-            0.08,
-        ))),
-        border_radius: 12.0.into(),
-        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
-        icon_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
-        ..Default::default()
-    }
-}
-
-fn history_button_style(focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
-    widget::button::Style {
-        background: focused.then_some(iced::Background::Color(iced::Color::from_rgba8(
-            0xFF,
-            0xFF,
-            0xFF,
-            0.06,
-        ))),
-        border_radius: 8.0.into(),
-        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
-        icon_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
         ..Default::default()
     }
 }
