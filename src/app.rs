@@ -484,8 +484,8 @@ impl AppModel {
             .height(72)
             .style(|theme| {
                 let cosmic = theme.cosmic();
-                let base: iced::Color = cosmic.background(false).base.into();
-                let divider: iced::Color = cosmic.background(false).divider.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                let divider: iced::Color = cosmic.background(theme.transparent).divider.into();
                 iced::widget::container::Style {
                     background: Some(iced::Background::Color(iced::Color { a: 0.08, ..base })),
                     border: iced::Border {
@@ -548,9 +548,9 @@ impl AppModel {
             .padding([14, 20])
             .style(|theme| {
                 let cosmic = theme.cosmic();
-                let base: iced::Color = cosmic.background(false).base.into();
-                let on: iced::Color = cosmic.background(false).on.into();
-                let divider: iced::Color = cosmic.background(false).divider.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                let on: iced::Color = cosmic.background(theme.transparent).on.into();
+                let divider: iced::Color = cosmic.background(theme.transparent).divider.into();
                 iced::widget::container::Style {
                     background: Some(iced::Background::Color(iced::Color { a: 0.30, ..base })),
                     text_color: Some(on),
@@ -573,29 +573,6 @@ impl AppModel {
     fn history_row(&self, entry: &HistoryEntry, index: usize) -> Element<'_, Message> {
         let is_active = entry.text == self.current;
 
-        let icon_container = {
-            let icon = widget::icon::from_name(entry_icon(entry.kind))
-                .size(18);
-            widget::container(icon)
-                .width(36)
-                .height(36)
-                .style(|theme| {
-                    let cosmic = theme.cosmic();
-                    let base: iced::Color = cosmic.background(false).base.into();
-                    let divider: iced::Color = cosmic.background(false).divider.into();
-                    iced::widget::container::Style {
-                        background: Some(iced::Background::Color(iced::Color { a: 0.10, ..base })),
-                        border: iced::Border {
-                            radius: 12.0.into(),
-                            width: 0.5,
-                            color: divider,
-                        },
-                        ..Default::default()
-                    }
-                })
-                .into()
-        };
-
         let text_column = widget::column::with_children(vec![
             widget::text::body(entry_preview(&entry.text))
                 .size(14)
@@ -611,7 +588,7 @@ impl AppModel {
             )
             .style(|theme| {
                 let cosmic = theme.cosmic();
-                let on: iced::Color = cosmic.background(false).on.into();
+                let on: iced::Color = cosmic.background(theme.transparent).on.into();
                 iced::widget::container::Style {
                     text_color: Some(iced::Color { a: 0.50, ..on }),
                     ..Default::default()
@@ -624,7 +601,6 @@ impl AppModel {
 
         let activate = widget::button::custom(
             widget::row::with_children(vec![
-                icon_container,
                 text_column.into(),
             ])
             .spacing(12)
@@ -635,8 +611,8 @@ impl AppModel {
         .class(theme::Button::Custom {
             active: Box::new(move |focused, theme| {
                 let cosmic = theme.cosmic();
-                let base: iced::Color = cosmic.background(false).base.into();
-                let on: iced::Color = cosmic.background(false).on.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                let on: iced::Color = cosmic.background(theme.transparent).on.into();
                 let opacity = if is_active { 0.22 } else if focused { 0.20 } else { 0.14 };
                 widget::button::Style {
                     background: Some(iced::Background::Color(iced::Color { a: opacity, ..base })),
@@ -651,8 +627,8 @@ impl AppModel {
             }),
             disabled: Box::new(move |theme| {
                 let cosmic = theme.cosmic();
-                let base: iced::Color = cosmic.background(false).base.into();
-                let on: iced::Color = cosmic.background(false).on.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                let on: iced::Color = cosmic.background(theme.transparent).on.into();
                 widget::button::Style {
                     background: Some(iced::Background::Color(iced::Color { a: 0.14, ..base })),
                     border_radius: 18.0.into(),
@@ -663,8 +639,8 @@ impl AppModel {
             }),
             hovered: Box::new(move |_focused, theme| {
                 let cosmic = theme.cosmic();
-                let base: iced::Color = cosmic.background(false).base.into();
-                let on: iced::Color = cosmic.background(false).on.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                let on: iced::Color = cosmic.background(theme.transparent).on.into();
                 let opacity = if is_active { 0.24 } else { 0.20 };
                 widget::button::Style {
                     background: Some(iced::Background::Color(iced::Color { a: opacity, ..base })),
@@ -679,8 +655,8 @@ impl AppModel {
             }),
             pressed: Box::new(move |_focused, theme| {
                 let cosmic = theme.cosmic();
-                let base: iced::Color = cosmic.background(false).base.into();
-                let on: iced::Color = cosmic.background(false).on.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                let on: iced::Color = cosmic.background(theme.transparent).on.into();
                 widget::button::Style {
                     background: Some(iced::Background::Color(iced::Color { a: 0.22, ..base })),
                     border_radius: 18.0.into(),
@@ -736,10 +712,10 @@ fn icon_button<'a>(icon_name: &'static str, pinned: bool) -> widget::Button<'a, 
 
 fn glass_icon_style(focused: bool, pinned: bool, theme: &cosmic::Theme) -> widget::button::Style {
     let cosmic = theme.cosmic();
-    let base: iced::Color = cosmic.background(false).base.into();
-    let on: iced::Color = cosmic.background(false).on.into();
+    let base: iced::Color = cosmic.background(theme.transparent).base.into();
+    let on: iced::Color = cosmic.background(theme.transparent).on.into();
     let accent: iced::Color = cosmic.accent.base.into();
-    let divider: iced::Color = cosmic.background(false).divider.into();
+    let divider: iced::Color = cosmic.background(theme.transparent).divider.into();
 
     let opacity = if pinned {
         0.28
@@ -757,19 +733,6 @@ fn glass_icon_style(focused: bool, pinned: bool, theme: &cosmic::Theme) -> widge
         text_color: Some(on),
         icon_color: Some(if pinned { accent } else { on }),
         ..Default::default()
-    }
-}
-
-fn entry_icon(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::Text => "text-x-generic-symbolic",
-        EntryKind::Url => "web-browser-symbolic",
-        EntryKind::Command => "terminal-symbolic",
-        EntryKind::Code => "text-x-source-symbolic",
-        EntryKind::Image => "image-x-generic-symbolic",
-        EntryKind::File => "text-x-generic-symbolic",
-        EntryKind::Color => "color-select-symbolic",
-        EntryKind::Email => "mail-send-symbolic",
     }
 }
 
