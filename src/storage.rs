@@ -27,9 +27,13 @@ struct SavedState {
 }
 
 pub async fn load_history() -> Vec<HistoryEntry> {
-    tokio::task::spawn_blocking(load_history_sync)
-        .await
-        .unwrap_or_default()
+    match tokio::task::spawn_blocking(load_history_sync).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::error!("history load task panicked: {e}");
+            Vec::new()
+        }
+    }
 }
 
 fn load_history_sync() -> Vec<HistoryEntry> {
@@ -38,17 +42,17 @@ fn load_history_sync() -> Vec<HistoryEntry> {
     match try_load_from(&path) {
         Ok(Some(entries)) => return entries,
         Ok(None) => return Vec::new(),
-        Err(e) => eprintln!("clipboard-applet: failed to load history: {e}"),
+        Err(e) => tracing::warn!("failed to load history: {e}"),
     }
 
     let bak = data_file_bak();
     match try_load_from(&bak) {
         Ok(Some(entries)) => {
-            eprintln!("clipboard-applet: restored {} entries from backup", entries.len());
+            tracing::warn!("restored {} entries from backup", entries.len());
             return entries;
         }
-        Ok(None) => eprintln!("clipboard-applet: no backup file found"),
-        Err(e) => eprintln!("clipboard-applet: backup also failed: {e}"),
+        Ok(None) => tracing::warn!("no backup file found"),
+        Err(e) => tracing::error!("backup also failed: {e}"),
     }
 
     Vec::new()
@@ -65,15 +69,20 @@ fn try_load_from(path: &Path) -> Result<Option<Vec<HistoryEntry>>, String> {
 
 pub async fn save_history(entries: &[HistoryEntry]) {
     let entries = entries.to_vec();
-    let _ = tokio::task::spawn_blocking(move || {
+    match tokio::task::spawn_blocking(move || {
         save_history_sync(&entries);
     })
-    .await;
+    .await
+    {
+        Ok(()) => {}
+        Err(e) => tracing::error!("history save task panicked: {e}"),
+    }
 }
 
 fn save_history_sync(entries: &[HistoryEntry]) {
     let dir = data_dir();
-    if fs::create_dir_all(&dir).is_err() {
+    if let Err(e) = fs::create_dir_all(&dir) {
+        tracing::error!("failed to create data dir {}: {e}", dir.display());
         return;
     }
 
@@ -81,10 +90,18 @@ fn save_history_sync(entries: &[HistoryEntry]) {
     let tmp_path = dir.join("history.json.tmp");
 
     let bak = data_file_bak();
-    if let Ok(Some(_)) = try_load_from(&path) {
-        let _ = fs::copy(&path, &bak);
-    } else if path.exists() && !bak.exists() {
-        let _ = fs::copy(&path, &bak);
+    let backupable = match try_load_from(&path) {
+        Ok(Some(_)) => true,
+        Ok(None) => path.exists() && !bak.exists(),
+        Err(e) => {
+            tracing::warn!("cannot inspect {} for backup: {e}", path.display());
+            false
+        }
+    };
+    if backupable {
+        if let Err(e) = fs::copy(&path, &bak) {
+            tracing::warn!("failed to create backup {}: {e}", bak.display());
+        }
     }
 
     let state = SavedState {
@@ -92,9 +109,16 @@ fn save_history_sync(entries: &[HistoryEntry]) {
         entries: entries.to_vec(),
     };
 
-    if let Ok(json) = serde_json::to_string_pretty(&state) {
-        if fs::write(&tmp_path, &json).is_ok() {
-            let _ = fs::rename(&tmp_path, &path);
+    match serde_json::to_string_pretty(&state) {
+        Ok(json) => {
+            if let Err(e) = fs::write(&tmp_path, &json) {
+                tracing::error!("failed to write {}: {e}", tmp_path.display());
+                return;
+            }
+            if let Err(e) = fs::rename(&tmp_path, &path) {
+                tracing::error!("failed to rename {} -> {}: {e}", tmp_path.display(), path.display());
+            }
         }
+        Err(e) => tracing::error!("failed to serialize history: {e}"),
     }
 }

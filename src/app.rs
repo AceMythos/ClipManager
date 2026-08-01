@@ -257,8 +257,14 @@ impl cosmic::Application for AppModel {
                 let new_id = iced::window::Id::unique();
                 self.popup.replace(new_id);
 
+                let Some(main_window_id) = self.core.main_window_id() else {
+                    tracing::error!("no main window id; cannot open popup");
+                    self.popup = None;
+                    return Task::none();
+                };
+
                 let mut settings = self.core.applet.get_popup_settings(
-                    self.core.main_window_id().unwrap(),
+                    main_window_id,
                     new_id,
                     Some((POPUP_WIDTH as u32, POPUP_HEIGHT as u32)),
                     None,
@@ -323,10 +329,7 @@ impl cosmic::Application for AppModel {
                 let current_text = self.current.clone();
                 let claim_clipboard = Task::perform(
                     async move {
-                        let _ = tokio::process::Command::new("wl-copy")
-                            .arg(&current_text)
-                            .output()
-                            .await;
+                        run_wl_copy(&current_text).await;
                     },
                     |_| cosmic::Action::None,
                 );
@@ -342,10 +345,7 @@ impl cosmic::Application for AppModel {
                     let entry_text = entry.text.clone();
                     return Task::perform(
                         async move {
-                            let _ = tokio::process::Command::new("wl-copy")
-                                .arg(&entry_text)
-                                .output()
-                                .await;
+                            run_wl_copy(&entry_text).await;
                             entry_text
                         },
                         |txt| cosmic::Action::from(Message::ClipChanged(txt)),
@@ -437,8 +437,8 @@ impl AppModel {
         let to_remove = self.history.iter().filter(|e| !e.pinned && e.copied_at <= cutoff).count();
 
         if unpinned_before > 0 && to_remove as f64 / unpinned_before as f64 > 0.9 {
-            eprintln!(
-                "clipboard-applet: prune skipped — would remove {to_remove}/{unpinned_before} unpinned entries (>{:.0}%), cutoff={cutoff}",
+            tracing::warn!(
+                "prune skipped — would remove {to_remove}/{unpinned_before} unpinned entries (>{:.0}%), cutoff={cutoff}",
                 0.9 * 100.0,
             );
             return false;
@@ -448,7 +448,7 @@ impl AppModel {
 
         let removed = before - self.history.len();
         if removed > 0 {
-            eprintln!("clipboard-applet: pruned {removed} expired entries (kept {})", self.history.len());
+            tracing::info!("pruned {removed} expired entries (kept {})", self.history.len());
             if !self.history.front().map(|e| e.text == self.current).unwrap_or(false) {
                 self.current = self.history.front().map(|e| e.text.clone()).unwrap_or_default();
             }
@@ -954,6 +954,20 @@ fn time_ago(copied_at: DateTime<Local>) -> String {
         format!("{} hours ago", duration.num_hours())
     } else {
         format!("{} days ago", duration.num_days())
+    }
+}
+
+async fn run_wl_copy(text: &str) {
+    match tokio::process::Command::new("wl-copy").arg(text).output().await {
+        Ok(out) if !out.status.success() => {
+            tracing::warn!(
+                "wl-copy failed (exit {:?}): {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!("failed to run wl-copy: {e}"),
     }
 }
 
