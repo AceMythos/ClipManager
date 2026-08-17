@@ -1,0 +1,109 @@
+{
+  "version": 1,
+  "project": {
+    "name": "ClipManager",
+    "slug": "clipmanager",
+    "tagline": "Clipboard history applet for COSMIC desktop",
+    "iconDomain": "github.com",
+    "date": "2026-07-19"
+  },
+  "stats": {
+    "agents": 0,
+    "models": 0,
+    "tools": 0,
+    "integrations": 2
+  },
+  "topModels": [],
+  "topTools": [],
+  "topIntegrations": [
+    { "id": "wl-clipboard", "label": "wl-clipboard", "domain": "github.com" },
+    { "id": "libnotify", "label": "libnotify", "domain": "github.com" }
+  ],
+  "graph": {
+    "nodes": [
+      {
+        "id": "main",
+        "label": "App entry",
+        "kind": "entry",
+        "sourceRef": "src/main.rs:4"
+      },
+      {
+        "id": "panel-icon",
+        "label": "Panel icon",
+        "kind": "entry",
+        "sub": "Truncated preview in panel"
+      },
+      {
+        "id": "popup",
+        "label": "History popup",
+        "kind": "entry",
+        "sub": "Search, pin, delete entries"
+      },
+      {
+        "id": "clip-watcher",
+        "label": "Clipboard poller",
+        "kind": "service",
+        "sub": "Polls wl-paste every 450ms",
+        "sourceRef": "src/app.rs:703",
+        "detail": "Async loop polling wl-paste; sends new text to AppModel on change"
+      },
+      {
+        "id": "prune-timer",
+        "label": "Expiry pruner",
+        "kind": "cron",
+        "sub": "Every 30 minutes",
+        "sourceRef": "src/app.rs:732",
+        "detail": "Subscription firing every 30 min to remove entries older than 48h"
+      },
+      {
+        "id": "app-model",
+        "label": "AppModel",
+        "kind": "service",
+        "sub": "State + message handler",
+        "sourceRef": "src/app.rs:55",
+        "detail": "History ring buffer, search state, private mode. Handles all Message variants"
+      },
+      {
+        "id": "storage",
+        "label": "JSON persistence",
+        "kind": "service",
+        "sub": "Async file I/O with backup",
+        "sourceRef": "src/storage.rs:29",
+        "detail": "Reads/writes history.json atomically via temp-file rename; falls back to .bak"
+      },
+      {
+        "id": "history-json",
+        "label": "history.json",
+        "kind": "store",
+        "sub": "~/.local/share/.../history.json"
+      },
+      {
+        "id": "wl-clipboard",
+        "label": "wl-clipboard",
+        "kind": "external",
+        "domain": "github.com"
+      },
+      {
+        "id": "libnotify",
+        "label": "libnotify",
+        "kind": "external",
+        "domain": "github.com"
+      }
+    ],
+    "edges": [
+      { "from": "main", "to": "panel-icon", "kind": "triggers" },
+      { "from": "main", "to": "clip-watcher", "kind": "triggers" },
+      { "from": "main", "to": "prune-timer", "kind": "triggers" },
+      { "from": "panel-icon", "to": "popup", "kind": "triggers", "label": "click opens popup" },
+      { "from": "clip-watcher", "to": "wl-clipboard", "kind": "calls" },
+      { "from": "clip-watcher", "to": "app-model", "kind": "writes", "label": "new clipboard text" },
+      { "from": "popup", "to": "wl-clipboard", "kind": "calls", "label": "copies selected entry" },
+      { "from": "popup", "to": "libnotify", "kind": "calls", "label": "pin/unpin toast" },
+      { "from": "app-model", "to": "storage", "kind": "calls", "label": "persist on mutation" },
+      { "from": "app-model", "to": "libnotify", "kind": "calls", "label": "copied notification" },
+      { "from": "storage", "to": "history-json", "kind": "reads" },
+      { "from": "storage", "to": "history-json", "kind": "writes" },
+      { "from": "prune-timer", "to": "app-model", "kind": "triggers" }
+    ]
+  }
+}

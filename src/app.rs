@@ -16,6 +16,7 @@ const PANEL_PREVIEW_CHARS: usize = 14;
 const POPUP_PREVIEW_CHARS: usize = 120;
 const POPUP_WIDTH: f32 = 920.0;
 const POPUP_HEIGHT: f32 = 640.0;
+const MAX_HTML_BYTES: usize = 1024 * 1024;
 
 // --- Glass design tokens ---
 const RADIUS_POPUP: f32 = 24.0;
@@ -37,9 +38,17 @@ const SPACING_SEARCH: f32 = 42.0;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {
     text: String,
+    #[serde(default)]
+    html: Option<String>,
     kind: EntryKind,
     copied_at: DateTime<Local>,
     pinned: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClipData {
+    text: String,
+    html: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +106,7 @@ impl Default for AppModel {
 pub enum Message {
     TogglePopup,
     PopupClosed(iced::window::Id),
-    ClipChanged(String),
+    ClipChanged(ClipData),
     ActivateEntry(usize),
     TogglePin(usize),
     DeleteEntry(usize),
@@ -288,8 +297,8 @@ impl cosmic::Application for AppModel {
                     self.confirm_clear = false;
                 }
             }
-            Message::ClipChanged(text) => {
-                let cleaned = compact_text(&text);
+            Message::ClipChanged(data) => {
+                let cleaned = data.text.trim().to_string();
                 if cleaned.is_empty() || cleaned == self.current {
                     return Task::none();
                 }
@@ -309,8 +318,10 @@ impl cosmic::Application for AppModel {
                     .unwrap_or(false);
 
                 self.history.retain(|entry| entry.text != cleaned);
+                let html = data.html.clone();
                 self.history.push_front(HistoryEntry {
                     text: cleaned,
+                    html,
                     kind,
                     copied_at: Local::now(),
                     pinned,
@@ -327,9 +338,10 @@ impl cosmic::Application for AppModel {
                 }
 
                 let current_text = self.current.clone();
+                let current_html = data.html;
                 let claim_clipboard = Task::perform(
                     async move {
-                        run_wl_copy(&current_text).await;
+                        wl_copy(&current_text, current_html.as_deref()).await;
                     },
                     |_| cosmic::Action::None,
                 );
@@ -343,12 +355,13 @@ impl cosmic::Application for AppModel {
             Message::ActivateEntry(i) => {
                 if let Some(entry) = self.history.get(i) {
                     let entry_text = entry.text.clone();
+                    let entry_html = entry.html.clone();
+                    self.current = entry_text.clone();
                     return Task::perform(
                         async move {
-                            run_wl_copy(&entry_text).await;
-                            entry_text
+                            wl_copy(&entry_text, entry_html.as_deref()).await;
                         },
-                        |txt| cosmic::Action::from(Message::ClipChanged(txt)),
+                        |_| cosmic::Action::None,
                     );
                 }
             }
@@ -866,25 +879,18 @@ fn detect_kind(text: &str) -> EntryKind {
     }
 }
 
-fn clip_sub() -> Subscription<String> {
+fn clip_sub() -> Subscription<ClipData> {
     Subscription::run(|| {
         iced::stream::channel(
             100,
-            |mut out: iced::futures::channel::mpsc::Sender<String>| async move {
+            |mut out: iced::futures::channel::mpsc::Sender<ClipData>| async move {
                 let mut last_seen = String::new();
 
                 loop {
-                    if let Ok(output) = tokio::process::Command::new("wl-paste")
-                        .arg("--no-newline")
-                        .output()
-                        .await
-                    {
-                        if output.status.success() {
-                            let text = String::from_utf8_lossy(&output.stdout).to_string();
-                            if !text.is_empty() && text != last_seen {
-                                last_seen = text.clone();
-                                let _ = out.send(text).await;
-                            }
+                    if let Some(data) = read_clipboard().await {
+                        if !data.text.is_empty() && data.text != last_seen {
+                            last_seen = data.text.clone();
+                            let _ = out.send(data).await;
                         }
                     }
 
@@ -893,6 +899,56 @@ fn clip_sub() -> Subscription<String> {
             },
         )
     })
+}
+
+async fn read_clipboard() -> Option<ClipData> {
+    let types_output = tokio::process::Command::new("wl-paste")
+        .arg("--list-types")
+        .output()
+        .await
+        .ok()?;
+    if !types_output.status.success() {
+        return None;
+    }
+    let types = String::from_utf8_lossy(&types_output.stdout);
+    let has_plain = types.lines().any(|t| t.starts_with("text/plain"));
+    let has_html = types.lines().any(|t| t.starts_with("text/html"));
+    if !has_plain && !has_html {
+        return None;
+    }
+
+    let text = if has_plain {
+        let out = tokio::process::Command::new("wl-paste")
+            .arg("--no-newline")
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).to_string()
+    } else {
+        String::new()
+    };
+
+    let html = if has_html {
+        let out = tokio::process::Command::new("wl-paste")
+            .arg("--no-newline")
+            .arg("--type")
+            .arg("text/html")
+            .output()
+            .await
+            .ok()?;
+        if out.status.success() && out.stdout.len() <= MAX_HTML_BYTES {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Some(ClipData { text, html })
 }
 
 fn prune_sub() -> Subscription<()> {
@@ -957,18 +1013,26 @@ fn time_ago(copied_at: DateTime<Local>) -> String {
     }
 }
 
-async fn run_wl_copy(text: &str) {
-    match tokio::process::Command::new("wl-copy").arg(text).output().await {
-        Ok(out) if !out.status.success() => {
-            tracing::warn!(
-                "wl-copy failed (exit {:?}): {}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(_) => {}
-        Err(e) => tracing::error!("failed to run wl-copy: {e}"),
+async fn wl_copy(text: &str, html: Option<&str>) {
+    let mut sources = vec![wl_clipboard_rs::copy::MimeSource {
+        source: wl_clipboard_rs::copy::Source::Bytes(text.as_bytes().to_vec().into()),
+        mime_type: wl_clipboard_rs::copy::MimeType::Text,
+    }];
+    if let Some(html) = html {
+        sources.push(wl_clipboard_rs::copy::MimeSource {
+            source: wl_clipboard_rs::copy::Source::Bytes(html.as_bytes().to_vec().into()),
+            mime_type: wl_clipboard_rs::copy::MimeType::Specific("text/html".to_string()),
+        });
     }
+
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = wl_clipboard_rs::copy::copy_multi(wl_clipboard_rs::copy::Options::new(), sources)
+        {
+            tracing::warn!("wl-clipboard-rs copy_multi failed: {e}");
+        }
+    })
+    .await
+    .ok();
 }
 
 fn notify_task(summary: &'static str, body: &str, icon: &'static str) -> Task<cosmic::Action<Message>> {
