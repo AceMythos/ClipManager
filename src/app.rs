@@ -12,6 +12,10 @@ use tokio::io::AsyncReadExt;
 const APP_ID: &str = "com.github.igris.ClipManager";
 const MAX_HISTORY: usize = 10000;
 const MAX_AGE_HOURS: i64 = 48;
+/// Max expired entries dropped in a single prune pass. A long absence and a
+/// forward clock jump look identical at startup, so instead of refusing to prune
+/// we cap the blast radius and converge over a few passes.
+const PRUNE_BATCH: usize = 200;
 const NOTIFICATION_ID: &str = "41042";
 const PANEL_PREVIEW_CHARS: usize = 14;
 const POPUP_PREVIEW_CHARS: usize = 120;
@@ -463,23 +467,43 @@ impl cosmic::Application for AppModel {
     }
 }
 
+/// Indices of expired unpinned entries, newest-first, capped at [`PRUNE_BATCH`].
+/// Oldest entries sit at the tail of the newest-first deque, so the caller
+/// reverse-iterates to keep indices valid.
+fn expired_unpinned_indices(history: &VecDeque<HistoryEntry>, cutoff: DateTime<Local>) -> Vec<usize> {
+    history
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.pinned && e.copied_at <= cutoff)
+        .map(|(i, _)| i)
+        .take(PRUNE_BATCH)
+        .collect()
+}
+
+fn count_expired_unpinned(history: &VecDeque<HistoryEntry>, cutoff: DateTime<Local>) -> usize {
+    history
+        .iter()
+        .filter(|e| !e.pinned && e.copied_at <= cutoff)
+        .count()
+}
+
 impl AppModel {
     fn prune_expired(&mut self) -> bool {
         let cutoff = Local::now() - Duration::hours(MAX_AGE_HOURS);
         let before = self.history.len();
 
-        let unpinned_before = self.history.iter().filter(|e| !e.pinned).count();
-        let to_remove = self.history.iter().filter(|e| !e.pinned && e.copied_at <= cutoff).count();
+        let total_expired = count_expired_unpinned(&self.history, cutoff);
+        let victims = expired_unpinned_indices(&self.history, cutoff);
 
-        if unpinned_before > 0 && to_remove as f64 / unpinned_before as f64 > 0.9 {
-            tracing::warn!(
-                "prune skipped — would remove {to_remove}/{unpinned_before} unpinned entries (>{:.0}%), cutoff={cutoff}",
-                0.9 * 100.0,
-            );
-            return false;
+        for i in victims.into_iter().rev() {
+            self.history.remove(i);
         }
 
-        self.history.retain(|entry| entry.pinned || entry.copied_at > cutoff);
+        if total_expired > PRUNE_BATCH {
+            tracing::info!(
+                "prune hit the {PRUNE_BATCH} cap ({total_expired} expired); remainder drops on the next pass"
+            );
+        }
 
         let removed = before - self.history.len();
         if removed > 0 {
@@ -1160,5 +1184,103 @@ mod tests {
     fn empty_and_mixed_case_are_handled() {
         assert!(can_serve_mime_types(""));
         assert!(can_serve_mime_types("TEXT/PLAIN\n"));
+    }
+
+    use super::{
+        count_expired_unpinned, expired_unpinned_indices, HistoryEntry, EntryKind, PRUNE_BATCH,
+    };
+    use chrono::{Duration, Local};
+    use std::collections::VecDeque;
+
+    fn entry(age_hours: i64, pinned: bool) -> HistoryEntry {
+        HistoryEntry {
+            text: format!("e{age_hours}h{}", if pinned { "p" } else { "" }),
+            html: None,
+            kind: EntryKind::Text,
+            copied_at: Local::now() - Duration::hours(age_hours),
+            pinned,
+        }
+    }
+
+    /// Newest-first, like the real deque.
+    fn history(ages: &[(i64, bool)]) -> VecDeque<HistoryEntry> {
+        VecDeque::from(ages.iter().map(|(a, p)| entry(*a, *p)).collect::<Vec<_>>())
+    }
+
+    fn cutoff() -> chrono::DateTime<Local> {
+        Local::now() - Duration::hours(48)
+    }
+
+    /// Regression for the old 0.9-ratio guard: when every unpinned entry is
+    /// expired (long absence, or a clock jump) the old code refused to prune
+    /// anything. It must now make progress instead.
+    #[test]
+    fn all_expired_still_prunes_up_to_the_cap() {
+        let h = history(&[(100, false); 500]);
+        let victims = expired_unpinned_indices(&h, cutoff());
+        assert_eq!(count_expired_unpinned(&h, cutoff()), 500);
+        assert_eq!(victims.len(), PRUNE_BATCH);
+    }
+
+    #[test]
+    fn under_cap_removes_everything_expired() {
+        let h = history(&[(1, false), (2, false), (100, false), (200, false), (300, false)]);
+        assert_eq!(expired_unpinned_indices(&h, cutoff()).len(), 3);
+    }
+
+    #[test]
+    fn nothing_expired_removes_nothing() {
+        let h = history(&[(0, false), (1, false), (10, false), (47, false)]);
+        assert!(expired_unpinned_indices(&h, cutoff()).is_empty());
+        assert_eq!(count_expired_unpinned(&h, cutoff()), 0);
+    }
+
+    #[test]
+    fn pinned_are_never_victims_even_when_old() {
+        let h = history(&[(100, true), (500, true), (900, true)]);
+        assert!(expired_unpinned_indices(&h, cutoff()).is_empty());
+        assert_eq!(count_expired_unpinned(&h, cutoff()), 0);
+    }
+
+    /// Applying the victims must leave pinned and fresh entries untouched.
+    #[test]
+    fn applying_victims_spares_pinned_and_fresh() {
+        let mut h = history(&[
+            (1, false),   // fresh, keep
+            (100, true),  // old but pinned, keep
+            (200, false), // expired, drop
+            (300, true),  // old but pinned, keep
+            (400, false), // expired, drop
+        ]);
+        for i in expired_unpinned_indices(&h, cutoff()).into_iter().rev() {
+            h.remove(i);
+        }
+        assert_eq!(h.len(), 3);
+        let texts: Vec<&str> = h.iter().map(|e| e.text.as_str()).collect();
+        assert!(texts.contains(&"e1h"));
+        assert!(texts.contains(&"e100hp"));
+        assert!(texts.contains(&"e300hp"));
+        assert!(!texts.contains(&"e200h"));
+        assert!(!texts.contains(&"e400h"));
+    }
+
+    /// Repeated passes must converge — the whole point of capping.
+    #[test]
+    fn repeated_passes_converge() {
+        let mut h = history(&[(100, false); 500]);
+        let mut passes = 0;
+        while count_expired_unpinned(&h, cutoff()) > 0 {
+            let v = expired_unpinned_indices(&h, cutoff());
+            if v.is_empty() {
+                break;
+            }
+            for i in v.into_iter().rev() {
+                h.remove(i);
+            }
+            passes += 1;
+            assert!(passes < 10, "should converge in a few passes");
+        }
+        assert!(h.is_empty());
+        assert_eq!(passes, 3); // 500 / 200 -> 200, 200, 100
     }
 }
