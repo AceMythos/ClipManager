@@ -916,6 +916,12 @@ fn detect_kind(text: &str) -> EntryKind {
         EntryKind::Url
     } else if trimmed.contains('\n') || trimmed.contains("fn ") || trimmed.contains("let ") {
         EntryKind::Code
+    } else if trimmed.starts_with("file://")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with("~/")
+    {
+        // cosmic-files puts the bare path in text/plain on a file copy
+        EntryKind::File
     } else if trimmed.starts_with("#") || trimmed.starts_with("rgb") || trimmed.starts_with("hsl") {
         EntryKind::Color
     } else if trimmed.contains('@') && trimmed.contains('.') {
@@ -1184,6 +1190,31 @@ mod tests {
     fn empty_and_mixed_case_are_handled() {
         assert!(can_serve_mime_types(""));
         assert!(can_serve_mime_types("TEXT/PLAIN\n"));
+    }
+
+    use super::detect_kind;
+
+    #[test]
+    fn file_paths_are_detected() {
+        // the exact shape cosmic-files puts in text/plain on a file copy
+        assert_eq!(
+            detect_kind("/home/igris/Pictures/Screenshots/discharging3.png"),
+            EntryKind::File
+        );
+        assert_eq!(detect_kind("~/notes.md"), EntryKind::File);
+        assert_eq!(
+            detect_kind("file:///home/igris/a.txt"),
+            EntryKind::File
+        );
+    }
+
+    #[test]
+    fn detect_kind_still_behaves_for_other_kinds() {
+        assert_eq!(detect_kind("https://example.com"), EntryKind::Url);
+        assert_eq!(detect_kind("fn main() {}"), EntryKind::Code);
+        assert_eq!(detect_kind("#ff0000"), EntryKind::Color);
+        assert_eq!(detect_kind("a@b.com"), EntryKind::Email);
+        assert_eq!(detect_kind("just some words"), EntryKind::Text);
     }
 
     use super::{
