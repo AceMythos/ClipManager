@@ -1,32 +1,43 @@
 # ClipManager
 
-Clipboard history applet for COSMIC desktop panel.
+Clipboard history for the COSMIC panel. Copy something, click the icon, it's there.
 
-## What It Does
+## Features
 
-When you copy something, the panel icon shows a preview. Click it to open a popup with your full clipboard history.
+- Panel icon shows a preview of your last copy
+- Searchable history popup
+- Click an entry to copy it back
+- Pin entries to keep them forever
+- Private mode — stops recording
+- Unpinned entries vanish after 48 hours
 
-**Popup features:**
-- Search bar to filter entries
-- Click any entry to copy it back
-- Pin items (star icon) to keep them at the top
-- Delete individual entries or clear all
-- Private mode toggle — stops recording new copies
-- Auto-clear: entries older than 48 hours are automatically removed (pinned entries are kept)
+**Pinned = permanent.** They survive the 48h cleanup, the 10,000-entry cap, and Clear All. To delete one, unpin it first.
 
-**Panel icon** shows a truncated preview of your last copy.
+Images and file copies are **not** recorded, but they're left untouched so pasting still works.
 
 ## Install
 
 ```bash
 cargo build --release
 sudo install -m 755 target/release/clipManager /usr/bin/clipManager
-sudo cp clipManager.desktop /usr/share/applications/
+sudo cp "$PWD/clipManager.desktop" /usr/share/applications/
 ```
 
-Then add via **COSMIC Settings > Desktop > Panel**.
+Then add it in **COSMIC Settings → Desktop → Panel**.
 
-## Requirements
+> Using `pkexec`? It resets the working directory — use absolute paths.
 
-- `wl-clipboard` (`wl-paste` / `wl-copy`)
+## Needs
+
+- Rust ([rustup.rs](https://rustup.rs))
+- `wl-clipboard` 2.2+ (`wl-paste`, `wl-copy`)
 - `libnotify` (`notify-send`)
+
+## Notes
+
+History lives in `~/.local/share/com.github.igris.ClipManager/history.json`.
+Delete it to reset. Private mode resets on restart.
+
+```bash
+cargo test    # 11 tests
+```
