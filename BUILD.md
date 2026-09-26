@@ -3,6 +3,7 @@
 ## Build
 
 ```bash
+## cargo clean if theres a binary and then rm applet traces from usr bin and usr share applications
 cargo build --release
 ```
 

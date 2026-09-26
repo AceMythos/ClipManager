@@ -7,6 +7,7 @@ use cosmic::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use tokio::io::AsyncReadExt;
 
 const APP_ID: &str = "com.github.igris.ClipManager";
 const MAX_HISTORY: usize = 10000;
@@ -17,6 +18,19 @@ const POPUP_PREVIEW_CHARS: usize = 120;
 const POPUP_WIDTH: f32 = 920.0;
 const POPUP_HEIGHT: f32 = 640.0;
 const MAX_HTML_BYTES: usize = 1024 * 1024;
+
+/// Mime types we can faithfully re-offer when re-claiming clipboard ownership.
+/// A payload offering anything else (text/uri-list, x-special/gnome-copied-files,
+/// image/*, ...) must be left alone — re-copying it as plain text destroys the
+/// richer types and breaks pasting (e.g. file copies become "Pasted Text.txt").
+const SERVABLE_MIME_TYPES: &[&str] = &[
+    "text/plain",
+    "text/plain;charset=utf-8",
+    "text/html",
+    "UTF8_STRING",
+    "TEXT",
+    "STRING",
+];
 
 // --- Glass design tokens ---
 const RADIUS_POPUP: f32 = 24.0;
@@ -49,6 +63,9 @@ pub struct HistoryEntry {
 pub struct ClipData {
     text: String,
     html: Option<String>,
+    /// False when the source offered mime types we cannot re-serve, so we must
+    /// not take clipboard ownership.
+    can_serve: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,14 +354,19 @@ impl cosmic::Application for AppModel {
                     }
                 }
 
-                let current_text = self.current.clone();
-                let current_html = data.html;
-                let claim_clipboard = Task::perform(
-                    async move {
-                        wl_copy(&current_text, current_html.as_deref()).await;
-                    },
-                    |_| cosmic::Action::None,
-                );
+                let claim_clipboard = if data.can_serve {
+                    let current_text = self.current.clone();
+                    let current_html = data.html.clone();
+                    Task::perform(
+                        async move {
+                            wl_copy(&current_text, current_html.as_deref()).await;
+                        },
+                        |_| cosmic::Action::None,
+                    )
+                } else {
+                    tracing::info!("leaving clipboard with original owner (unservable mime types)");
+                    Task::none()
+                };
 
                 return Task::batch(vec![
                     self.schedule_save(),
@@ -884,21 +906,66 @@ fn clip_sub() -> Subscription<ClipData> {
         iced::stream::channel(
             100,
             |mut out: iced::futures::channel::mpsc::Sender<ClipData>| async move {
+                // wl-paste --watch fires once on start and once per selection change.
+                // The command only prints a byte, so we stay mime-agnostic here and
+                // let read_clipboard() do the typed reads.
+                let mut child = match tokio::process::Command::new("wl-paste")
+                    .arg("--watch")
+                    .arg("sh")
+                    .arg("-c")
+                    .arg("echo x")
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => child,
+                    Err(e) => {
+                        tracing::error!("failed to spawn wl-paste --watch: {e}");
+                        return;
+                    }
+                };
+
+                let Some(mut stdout) = child.stdout.take() else {
+                    tracing::error!("wl-paste --watch produced no stdout");
+                    return;
+                };
+
+                let mut buf = [0u8; 64];
                 let mut last_seen = String::new();
 
                 loop {
-                    if let Some(data) = read_clipboard().await {
-                        if !data.text.is_empty() && data.text != last_seen {
-                            last_seen = data.text.clone();
-                            let _ = out.send(data).await;
+                    match stdout.read(&mut buf).await {
+                        Ok(0) => {
+                            tracing::warn!("wl-paste --watch exited; clipboard watching stopped");
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!("wl-paste --watch read failed: {e}");
+                            break;
+                        }
+                        Ok(_) => {
+                            if let Some(data) = read_clipboard().await {
+                                if !data.text.is_empty() && data.text != last_seen {
+                                    last_seen = data.text.clone();
+                                    let _ = out.send(data).await;
+                                }
+                            }
                         }
                     }
-
-                    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
                 }
             },
         )
     })
+}
+
+/// True when every offered mime type can be faithfully re-served by [`wl_copy`].
+/// If any type is outside [`SERVABLE_MIME_TYPES`], taking clipboard ownership
+/// would silently drop it.
+fn can_serve_mime_types(types: &str) -> bool {
+    types
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .all(|t| SERVABLE_MIME_TYPES.iter().any(|s| s.eq_ignore_ascii_case(t)))
 }
 
 async fn read_clipboard() -> Option<ClipData> {
@@ -916,6 +983,8 @@ async fn read_clipboard() -> Option<ClipData> {
     if !has_plain && !has_html {
         return None;
     }
+
+    let can_serve = can_serve_mime_types(&types);
 
     let text = if has_plain {
         let out = tokio::process::Command::new("wl-paste")
@@ -948,7 +1017,7 @@ async fn read_clipboard() -> Option<ClipData> {
         None
     };
 
-    Some(ClipData { text, html })
+    Some(ClipData { text, html, can_serve })
 }
 
 fn prune_sub() -> Subscription<()> {
@@ -1055,4 +1124,41 @@ fn notify_task(summary: &'static str, body: &str, icon: &'static str) -> Task<co
         },
         |_| cosmic::Action::None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::can_serve_mime_types;
+
+    /// Real type list from cosmic-files on a file copy
+    /// (src/clipboard.rs:27-33). Regression: we must NOT claim ownership here,
+    /// or the file payload is destroyed and Ctrl+V yields "Pasted Text.txt".
+    #[test]
+    fn cosmic_file_copy_is_not_servable() {
+        let types = "text/plain\ntext/plain;charset=utf-8\nUTF8_STRING\ntext/uri-list\nx-special/gnome-copied-files\n";
+        assert!(!can_serve_mime_types(types));
+    }
+
+    /// Real type list observed from a terminal selection on this machine.
+    #[test]
+    fn terminal_text_is_servable() {
+        let types = "text/plain;charset=utf-8\nTEXT\nUTF8_STRING\ntext/plain\nSTRING\n";
+        assert!(can_serve_mime_types(types));
+    }
+
+    #[test]
+    fn image_only_is_not_servable() {
+        assert!(!can_serve_mime_types("image/png\n"));
+    }
+
+    #[test]
+    fn text_with_html_is_servable() {
+        assert!(can_serve_mime_types("text/plain\ntext/html\n"));
+    }
+
+    #[test]
+    fn empty_and_mixed_case_are_handled() {
+        assert!(can_serve_mime_types(""));
+        assert!(can_serve_mime_types("TEXT/PLAIN\n"));
+    }
 }
