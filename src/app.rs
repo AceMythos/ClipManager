@@ -7,22 +7,69 @@ use cosmic::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use tokio::io::AsyncReadExt;
 
 const APP_ID: &str = "com.github.igris.ClipManager";
 const MAX_HISTORY: usize = 10000;
 const MAX_AGE_HOURS: i64 = 48;
+/// Max expired entries dropped in a single prune pass. A long absence and a
+/// forward clock jump look identical at startup, so instead of refusing to prune
+/// we cap the blast radius and converge over a few passes.
+const PRUNE_BATCH: usize = 200;
 const NOTIFICATION_ID: &str = "41042";
 const PANEL_PREVIEW_CHARS: usize = 14;
 const POPUP_PREVIEW_CHARS: usize = 120;
 const POPUP_WIDTH: f32 = 920.0;
 const POPUP_HEIGHT: f32 = 640.0;
+const MAX_HTML_BYTES: usize = 1024 * 1024;
+
+/// Mime types we can faithfully re-offer when re-claiming clipboard ownership.
+/// A payload offering anything else (text/uri-list, x-special/gnome-copied-files,
+/// image/*, ...) must be left alone — re-copying it as plain text destroys the
+/// richer types and breaks pasting (e.g. file copies become "Pasted Text.txt").
+const SERVABLE_MIME_TYPES: &[&str] = &[
+    "text/plain",
+    "text/plain;charset=utf-8",
+    "text/html",
+    "UTF8_STRING",
+    "TEXT",
+    "STRING",
+];
+
+// --- Glass design tokens ---
+const RADIUS_POPUP: f32 = 24.0;
+const RADIUS_CARD: f32 = 16.0;
+const RADIUS_BTN: f32 = 16.0;
+const OPACITY_CARD: f32 = 0.78;
+const OPACITY_CARD_HOVER: f32 = 0.82;
+const OPACITY_SECTION: f32 = 0.60;
+const OPACITY_METADATA: f32 = 0.70;
+const CARD_LUM_DARKEN: f32 = 0.92;
+const CARD_LUM_HOVER: f32 = 0.96;
+const BORDER_GLASS: f32 = 0.08;
+const BORDER_GLASS_STRONG: f32 = 0.10;
+const BORDER_DIVIDER: f32 = 0.06;
+const SPACING_OUTER: f32 = 16.0;
+const SPACING_CARDS: u16 = 12;
+const SPACING_SEARCH: f32 = 42.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {
     text: String,
+    #[serde(default)]
+    html: Option<String>,
     kind: EntryKind,
     copied_at: DateTime<Local>,
     pinned: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClipData {
+    text: String,
+    html: Option<String>,
+    /// False when the source offered mime types we cannot re-serve, so we must
+    /// not take clipboard ownership.
+    can_serve: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -80,7 +127,7 @@ impl Default for AppModel {
 pub enum Message {
     TogglePopup,
     PopupClosed(iced::window::Id),
-    ClipChanged(String),
+    ClipChanged(ClipData),
     ActivateEntry(usize),
     TogglePin(usize),
     DeleteEntry(usize),
@@ -156,40 +203,53 @@ impl cosmic::Application for AppModel {
             .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .padding([8, 12])
+        .height(Length::Fixed(SPACING_SEARCH))
+        .padding([0, 20])
         .style(search_shell_style);
 
-        let divider = || {
-            widget::container(widget::Space::new().width(Length::Fill).height(Length::Fixed(1.0)))
-                .width(Length::Fill)
-                .style(divider_style)
-                .into()
-        };
-
-        let mut history_entries: Vec<Element<'_, Message>> = Vec::new();
+        let mut list_children: Vec<Element<'_, Message>> = Vec::new();
         if filtered_entries.is_empty() {
-            history_entries.push(self.empty_state());
+            list_children.push(self.empty_state());
         } else {
+            let has_pinned = filtered_entries.iter().any(|(_, e)| e.pinned);
+            let has_normal = filtered_entries.iter().any(|(_, e)| !e.pinned);
+
+            let mut added_pinned = false;
+            let mut added_normal = false;
+
             for (index, entry) in &filtered_entries {
-                history_entries.push(self.history_row(entry, *index));
+                if has_pinned && entry.pinned && !added_pinned {
+                    list_children.push(section_header("    PINNED"));
+                    added_pinned = true;
+                }
+                if has_normal && !entry.pinned && !added_normal {
+                    if added_pinned {
+                        let div = widget::container(
+                            widget::Space::new().width(Length::Fill).height(Length::Fixed(1.0)),
+                        )
+                        .width(Length::Fill)
+                        .padding([0, 12])
+                        .style(divider_style);
+                        list_children.push(div.into());
+                    }
+                    list_children.push(section_header("    RECENT"));
+                    added_normal = true;
+                }
+                list_children.push(self.history_row(entry, *index));
             }
         }
 
         let scrollable = widget::scrollable(
-            widget::column::with_children(history_entries).spacing(0),
+            widget::column::with_children(list_children).spacing(SPACING_CARDS),
         )
         .height(Length::Fill)
-        .width(Length::Fill);
+        .width(Length::Fill)
+        .class(theme::style::iced::Scrollable::Minimal);
 
         let content = widget::column::with_children(vec![
             search_bar.into(),
-            widget::Space::new().height(Length::Fixed(18.0)).into(),
-            divider(),
-            widget::Space::new().height(Length::Fixed(8.0)).into(),
+            widget::Space::new().height(Length::Fixed(SPACING_OUTER)).into(),
             scrollable.into(),
-            widget::Space::new().height(Length::Fixed(8.0)).into(),
-            divider(),
-            widget::Space::new().height(Length::Fixed(12.0)).into(),
             self.footer(filtered_entries.len()),
         ])
         .spacing(0);
@@ -198,7 +258,7 @@ impl cosmic::Application for AppModel {
             .applet
             .popup_container(
                 widget::container(content)
-                    .padding(26)
+                    .padding(SPACING_OUTER)
                     .width(Length::Fixed(POPUP_WIDTH))
                     .height(Length::Fixed(POPUP_HEIGHT))
                     .style(popup_style),
@@ -227,8 +287,14 @@ impl cosmic::Application for AppModel {
                 let new_id = iced::window::Id::unique();
                 self.popup.replace(new_id);
 
+                let Some(main_window_id) = self.core.main_window_id() else {
+                    tracing::error!("no main window id; cannot open popup");
+                    self.popup = None;
+                    return Task::none();
+                };
+
                 let mut settings = self.core.applet.get_popup_settings(
-                    self.core.main_window_id().unwrap(),
+                    main_window_id,
                     new_id,
                     Some((POPUP_WIDTH as u32, POPUP_HEIGHT as u32)),
                     None,
@@ -240,7 +306,11 @@ impl cosmic::Application for AppModel {
                     .min_height(POPUP_HEIGHT)
                     .max_height(POPUP_HEIGHT);
 
-                return cosmic::iced::platform_specific::shell::commands::popup::get_popup(settings);
+                let mut tasks = vec![
+                    cosmic::iced::platform_specific::shell::commands::popup::get_popup(settings),
+                ];
+                tasks.push(iced::window::enable_blur(new_id));
+                return Task::batch(tasks);
             }
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
@@ -248,8 +318,8 @@ impl cosmic::Application for AppModel {
                     self.confirm_clear = false;
                 }
             }
-            Message::ClipChanged(text) => {
-                let cleaned = compact_text(&text);
+            Message::ClipChanged(data) => {
+                let cleaned = data.text.trim().to_string();
                 if cleaned.is_empty() || cleaned == self.current {
                     return Task::none();
                 }
@@ -269,8 +339,10 @@ impl cosmic::Application for AppModel {
                     .unwrap_or(false);
 
                 self.history.retain(|entry| entry.text != cleaned);
+                let html = data.html.clone();
                 self.history.push_front(HistoryEntry {
                     text: cleaned,
+                    html,
                     kind,
                     copied_at: Local::now(),
                     pinned,
@@ -286,16 +358,19 @@ impl cosmic::Application for AppModel {
                     }
                 }
 
-                let current_text = self.current.clone();
-                let claim_clipboard = Task::perform(
-                    async move {
-                        let _ = tokio::process::Command::new("wl-copy")
-                            .arg(&current_text)
-                            .output()
-                            .await;
-                    },
-                    |_| cosmic::Action::None,
-                );
+                let claim_clipboard = if data.can_serve {
+                    let current_text = self.current.clone();
+                    let current_html = data.html.clone();
+                    Task::perform(
+                        async move {
+                            wl_copy(&current_text, current_html.as_deref()).await;
+                        },
+                        |_| cosmic::Action::None,
+                    )
+                } else {
+                    tracing::info!("leaving clipboard with original owner (unservable mime types)");
+                    Task::none()
+                };
 
                 return Task::batch(vec![
                     self.schedule_save(),
@@ -306,15 +381,13 @@ impl cosmic::Application for AppModel {
             Message::ActivateEntry(i) => {
                 if let Some(entry) = self.history.get(i) {
                     let entry_text = entry.text.clone();
+                    let entry_html = entry.html.clone();
+                    self.current = entry_text.clone();
                     return Task::perform(
                         async move {
-                            let _ = tokio::process::Command::new("wl-copy")
-                                .arg(&entry_text)
-                                .output()
-                                .await;
-                            entry_text
+                            wl_copy(&entry_text, entry_html.as_deref()).await;
                         },
-                        |txt| cosmic::Action::from(Message::ClipChanged(txt)),
+                        |_| cosmic::Action::None,
                     );
                 }
             }
@@ -394,27 +467,47 @@ impl cosmic::Application for AppModel {
     }
 }
 
+/// Indices of expired unpinned entries, newest-first, capped at [`PRUNE_BATCH`].
+/// Oldest entries sit at the tail of the newest-first deque, so the caller
+/// reverse-iterates to keep indices valid.
+fn expired_unpinned_indices(history: &VecDeque<HistoryEntry>, cutoff: DateTime<Local>) -> Vec<usize> {
+    history
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| !e.pinned && e.copied_at <= cutoff)
+        .map(|(i, _)| i)
+        .take(PRUNE_BATCH)
+        .collect()
+}
+
+fn count_expired_unpinned(history: &VecDeque<HistoryEntry>, cutoff: DateTime<Local>) -> usize {
+    history
+        .iter()
+        .filter(|e| !e.pinned && e.copied_at <= cutoff)
+        .count()
+}
+
 impl AppModel {
     fn prune_expired(&mut self) -> bool {
         let cutoff = Local::now() - Duration::hours(MAX_AGE_HOURS);
         let before = self.history.len();
 
-        let unpinned_before = self.history.iter().filter(|e| !e.pinned).count();
-        let to_remove = self.history.iter().filter(|e| !e.pinned && e.copied_at <= cutoff).count();
+        let total_expired = count_expired_unpinned(&self.history, cutoff);
+        let victims = expired_unpinned_indices(&self.history, cutoff);
 
-        if unpinned_before > 0 && to_remove as f64 / unpinned_before as f64 > 0.9 {
-            eprintln!(
-                "clipboard-applet: prune skipped — would remove {to_remove}/{unpinned_before} unpinned entries (>{:.0}%), cutoff={cutoff}",
-                0.9 * 100.0,
-            );
-            return false;
+        for i in victims.into_iter().rev() {
+            self.history.remove(i);
         }
 
-        self.history.retain(|entry| entry.pinned || entry.copied_at > cutoff);
+        if total_expired > PRUNE_BATCH {
+            tracing::info!(
+                "prune hit the {PRUNE_BATCH} cap ({total_expired} expired); remainder drops on the next pass"
+            );
+        }
 
         let removed = before - self.history.len();
         if removed > 0 {
-            eprintln!("clipboard-applet: pruned {removed} expired entries (kept {})", self.history.len());
+            tracing::info!("pruned {removed} expired entries (kept {})", self.history.len());
             if !self.history.front().map(|e| e.text == self.current).unwrap_or(false) {
                 self.current = self.history.front().map(|e| e.text.clone()).unwrap_or_default();
             }
@@ -462,21 +555,54 @@ impl AppModel {
             ("No results", "Try a different search term.")
         };
 
+        let icon = widget::icon::from_name("edit-paste-symbolic").size(48);
+        let icon_container = widget::container(icon)
+            .width(72)
+            .height(72)
+            .style(|theme| {
+                let cosmic = theme.cosmic();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                let divider: iced::Color = cosmic.background(theme.transparent).divider.into();
+                iced::widget::container::Style {
+                    background: Some(iced::Background::Color(iced::Color { a: 0.08, ..base })),
+                    border: iced::Border {
+                        radius: 20.0.into(),
+                        width: 0.5,
+                        color: divider,
+                    },
+                    ..Default::default()
+                }
+            });
+
         widget::container(
             widget::column::with_children(vec![
+                icon_container.into(),
+                widget::Space::new().height(Length::Fixed(16.0)).into(),
                 widget::text::body(title).size(18).into(),
-                widget::Space::new().height(Length::Fixed(10.0)).into(),
+                widget::Space::new().height(Length::Fixed(6.0)).into(),
                 widget::text::caption(caption).size(14).into(),
             ])
-            .width(Length::Fill),
+            .width(Length::Fill)
+            .align_x(Alignment::Center),
         )
         .width(Length::Fill)
-        .padding([18, 0])
+        .padding([40, 0])
         .style(popup_text_style)
         .into()
     }
 
     fn footer(&self, result_count: usize) -> Element<'_, Message> {
+        let divider = widget::container(
+            widget::Space::new().width(Length::Fill).height(Length::Fixed(1.0)),
+        )
+        .width(Length::Fill)
+        .style(|_| {
+            iced::widget::container::Style {
+                background: Some(iced::Background::Color(iced::Color::from_rgba(1.0, 1.0, 1.0, BORDER_DIVIDER))),
+                ..Default::default()
+            }
+        });
+
         let info = widget::text::caption(format!("{} items", result_count))
             .size(13);
 
@@ -496,58 +622,52 @@ impl AppModel {
             "user-trash-symbolic"
         };
 
-        widget::row::with_children(vec![
+        let inner = widget::row::with_children(vec![
             info.into(),
             widget::Space::new().width(Length::Fill).into(),
             private_toggle.into(),
             widget::Space::new().width(Length::Fixed(12.0)).into(),
-            icon_button(trash_icon).on_press(Message::ClearHistory).into(),
+            icon_button(trash_icon, false).on_press(Message::ClearHistory).into(),
         ])
-        .align_y(Alignment::Center)
+        .align_y(Alignment::Center);
+
+        widget::column::with_children(vec![
+            divider.into(),
+            widget::container(inner)
+                .width(Length::Fill)
+                .padding([16, 20])
+                .into(),
+        ])
         .into()
     }
 
     fn history_row(&self, entry: &HistoryEntry, index: usize) -> Element<'_, Message> {
-        let marker = widget::text::body(if entry.text == self.current { "•" } else { " " })
-            .size(20)
-            .width(Length::Fixed(18.0));
+        let is_active = entry.text == self.current;
 
-        let text_column = vec![
+        let text_column = widget::column::with_children(vec![
             widget::text::body(entry_preview(&entry.text))
-                .size(14)
+                .size(15)
                 .width(Length::Fill)
                 .into(),
             widget::Space::new().height(Length::Fixed(4.0)).into(),
-            widget::text::caption(format!(
-                "{} • {}",
-                entry.kind.label(),
-                time_ago(entry.copied_at)
-            ))
-            .size(11)
+            widget::container(
+                widget::row::with_children(vec![
+                    widget::text::caption(entry.kind.label()).size(12).into(),
+                    widget::Space::new().width(Length::Fixed(8.0)).into(),
+                    widget::text::caption(time_ago(entry.copied_at)).size(12).into(),
+                ])
+            )
+            .style(|theme| {
+                let on: iced::Color = theme.cosmic().background(false).on.into();
+                iced::widget::container::Style {
+                    text_color: Some(iced::Color { a: OPACITY_METADATA, ..on }),
+                    ..Default::default()
+                }
+            })
             .into(),
-        ];
-
-        let activate = widget::button::custom(
-            widget::row::with_children(vec![
-                marker.into(),
-                widget::column::with_children(text_column)
-                    .width(Length::Fill)
-                    .spacing(2)
-                    .into(),
-            ])
-            .spacing(12)
-            .align_y(Alignment::Center),
-        )
-        .class(widget::button::ButtonClass::Text)
-        .padding([12, 12])
+        ])
         .width(Length::Fill)
-        .class(theme::Button::Custom {
-            active: Box::new(history_button_style),
-            disabled: Box::new(|theme| history_button_style(false, theme)),
-            hovered: Box::new(history_button_style),
-            pressed: Box::new(history_button_style),
-        })
-        .on_press(Message::ActivateEntry(index));
+        .spacing(2);
 
         let pin_icon = if entry.pinned {
             "cpin-filled-symbolic"
@@ -556,61 +676,202 @@ impl AppModel {
         };
 
         let mut action_children: Vec<Element<_>> = vec![
-            icon_button(pin_icon).on_press(Message::TogglePin(index)).into(),
+            icon_button(pin_icon, entry.pinned).on_press(Message::TogglePin(index)).into(),
         ];
         if !entry.pinned {
             action_children.push(widget::Space::new().width(Length::Fixed(4.0)).into());
-            action_children.push(icon_button("user-trash-symbolic").on_press(Message::DeleteEntry(index)).into());
+            action_children.push(icon_button("user-trash-symbolic", false).on_press(Message::DeleteEntry(index)).into());
         }
         let actions = widget::row::with_children(action_children)
             .align_y(Alignment::Center);
 
+        let activate = widget::button::custom(
+            widget::row::with_children(vec![
+                text_column.into(),
+            ])
+            .spacing(12)
+            .align_y(Alignment::Center),
+        )
+        .padding([12, 16])
+        .width(Length::Fill)
+        .class(theme::Button::Custom {
+            active: Box::new(move |focused, theme| {
+                let cosmic = theme.cosmic();
+                let on: iced::Color = cosmic.background(false).on.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                let (r, g, b) = if is_active || focused {
+                    (base.r * CARD_LUM_HOVER, base.g * CARD_LUM_HOVER, base.b * CARD_LUM_HOVER)
+                } else {
+                    (base.r * CARD_LUM_DARKEN, base.g * CARD_LUM_DARKEN, base.b * CARD_LUM_DARKEN)
+                };
+                let alpha = if is_active { OPACITY_CARD_HOVER } else { OPACITY_CARD };
+                widget::button::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(r, g, b, alpha))),
+                    border_radius: RADIUS_CARD.into(),
+                    shadow_offset: iced::Vector::new(0.0, if focused || is_active { 2.0 } else { 0.0 }),
+                    text_color: Some(on),
+                    icon_color: Some(on),
+                    ..Default::default()
+                }
+            }),
+            disabled: Box::new(move |theme| {
+                let cosmic = theme.cosmic();
+                let on: iced::Color = cosmic.background(false).on.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                widget::button::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        base.r * CARD_LUM_DARKEN, base.g * CARD_LUM_DARKEN, base.b * CARD_LUM_DARKEN, OPACITY_CARD,
+                    ))),
+                    border_radius: RADIUS_CARD.into(),
+                    text_color: Some(on),
+                    icon_color: Some(on),
+                    ..Default::default()
+                }
+            }),
+            hovered: Box::new(move |_focused, theme| {
+                let cosmic = theme.cosmic();
+                let on: iced::Color = cosmic.background(false).on.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                let (r, g, b) = if is_active {
+                    (base.r * CARD_LUM_HOVER, base.g * CARD_LUM_HOVER, base.b * CARD_LUM_HOVER)
+                } else {
+                    (base.r * CARD_LUM_HOVER, base.g * CARD_LUM_HOVER, base.b * CARD_LUM_HOVER)
+                };
+                let alpha = if is_active { OPACITY_CARD_HOVER } else { OPACITY_CARD_HOVER };
+                widget::button::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(r, g, b, alpha))),
+                    border_radius: RADIUS_CARD.into(),
+                    shadow_offset: iced::Vector::new(0.0, 2.0),
+                    text_color: Some(on),
+                    icon_color: Some(on),
+                    ..Default::default()
+                }
+            }),
+            pressed: Box::new(move |_focused, theme| {
+                let cosmic = theme.cosmic();
+                let on: iced::Color = cosmic.background(false).on.into();
+                let base: iced::Color = cosmic.background(theme.transparent).base.into();
+                widget::button::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        base.r * CARD_LUM_HOVER, base.g * CARD_LUM_HOVER, base.b * CARD_LUM_HOVER, OPACITY_CARD_HOVER + 0.04,
+                    ))),
+                    border_radius: RADIUS_CARD.into(),
+                    text_color: Some(on),
+                    icon_color: Some(on),
+                    ..Default::default()
+                }
+            }),
+        })
+        .on_press(Message::ActivateEntry(index));
+
         widget::container(
             widget::row::with_children(vec![
                 activate.into(),
-                widget::Space::new().width(Length::Fixed(16.0)).into(),
+                widget::Space::new().width(Length::Fixed(8.0)).into(),
                 actions.into(),
             ])
             .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .padding([3, 0])
-        .style(popup_text_style)
+        .style(card_default)
         .into()
     }
 }
 
-fn icon_button<'a>(icon_name: &'static str) -> widget::Button<'a, Message> {
+fn card_default(theme: &cosmic::Theme) -> iced::widget::container::Style {
+    let cosmic = theme.cosmic();
+    let base: iced::Color = cosmic.background(theme.transparent).base.into();
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgba(
+            base.r * CARD_LUM_DARKEN,
+            base.g * CARD_LUM_DARKEN,
+            base.b * CARD_LUM_DARKEN,
+            OPACITY_CARD,
+        ))),
+        border: iced::Border {
+            radius: RADIUS_CARD.into(),
+            width: 0.0,
+            color: iced::Color::TRANSPARENT,
+        },
+        ..Default::default()
+    }
+}
+
+fn icon_button<'a>(icon_name: &'static str, pinned: bool) -> widget::Button<'a, Message> {
     widget::button::custom(widget::icon::from_name(icon_name).size(18))
         .class(theme::Button::Custom {
-            active: Box::new(icon_button_style),
-            disabled: Box::new(|theme| icon_button_style(false, theme)),
-            hovered: Box::new(icon_button_style),
-            pressed: Box::new(icon_button_style),
+            active: Box::new(move |focused, theme| glass_icon_style(focused, pinned, theme)),
+            disabled: Box::new(move |theme| glass_icon_style(false, pinned, theme)),
+            hovered: Box::new(move |focused, theme| glass_icon_style(focused, pinned, theme)),
+            pressed: Box::new(move |focused, theme| glass_icon_style(focused, pinned, theme)),
         })
         .padding([8, 8])
 }
 
-fn popup_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
-    let bg = if theme.transparent {
-        iced::Background::Gradient(iced::Gradient::Linear(
-            iced::gradient::Linear::new(std::f32::consts::PI)
-                .add_stop(0.0, iced::Color::from_rgba8(0x27, 0x27, 0x27, 0.65))
-                .add_stop(1.0, iced::Color::from_rgba8(0x27, 0x27, 0x27, 0.85)),
-        ))
+fn glass_icon_style(focused: bool, pinned: bool, theme: &cosmic::Theme) -> widget::button::Style {
+    let on: iced::Color = theme.cosmic().background(false).on.into();
+    let accent: iced::Color = theme.cosmic().accent.base.into();
+
+    let alpha = if pinned {
+        0.08
+    } else if focused {
+        0.06
     } else {
-        iced::Background::Color(iced::Color::from_rgb8(0x27, 0x27, 0x27))
+        0.04
     };
+    let shadow_offset = if focused { 3.0 } else { 1.0 };
+
+    widget::button::Style {
+        background: Some(iced::Background::Color(iced::Color::from_rgba(1.0, 1.0, 1.0, alpha))),
+        border_radius: RADIUS_BTN.into(),
+        border_width: 0.0,
+        shadow_offset: iced::Vector::new(0.0, shadow_offset),
+        text_color: Some(on),
+        icon_color: Some(if pinned { accent } else { on }),
+        ..Default::default()
+    }
+}
+
+fn section_header(label: &'static str) -> Element<'static, Message> {
+    widget::container(
+        widget::text::caption(label)
+            .size(13)
+            .width(Length::Fill),
+    )
+    .padding([18, 12, 8, 12])
+    .width(Length::Fill)
+    .style(|theme| {
+        let on: iced::Color = theme.cosmic().background(false).on.into();
+        iced::widget::container::Style {
+            text_color: Some(iced::Color { a: OPACITY_SECTION, ..on }),
+            ..Default::default()
+        }
+    })
+    .into()
+}
+
+fn popup_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
+    let cosmic = theme.cosmic();
+    let on: iced::Color = cosmic.background(false).on.into();
+
+    let bg = if theme.transparent {
+        let base: iced::Color = cosmic.background(true).base.into();
+        iced::Background::Color(base)
+    } else {
+        let base: iced::Color = cosmic.background(false).base.into();
+        iced::Background::Color(iced::Color { a: 0.95, ..base })
+    };
+
     iced::widget::container::Style {
         background: Some(bg),
-        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        text_color: Some(on),
         border: iced::Border {
-            radius: 12.0.into(),
+            radius: RADIUS_POPUP.into(),
             width: 1.0,
-            color: iced::Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.12),
+            color: iced::Color::from_rgba(1.0, 1.0, 1.0, BORDER_GLASS),
         },
         shadow: iced::Shadow {
-            color: iced::Color::from_rgba8(0x00, 0x00, 0x00, 0.40),
+            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.25),
             offset: iced::Vector::new(0.0, 16.0),
             blur_radius: 40.0,
         },
@@ -618,68 +879,32 @@ fn popup_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
     }
 }
 
-fn popup_text_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
+fn popup_text_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
+    let on: iced::Color = theme.cosmic().background(false).on.into();
     iced::widget::container::Style {
-        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
+        text_color: Some(on),
         ..Default::default()
     }
 }
 
 fn divider_style(_theme: &cosmic::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
-        background: Some(iced::Background::Color(iced::Color::from_rgba8(
-            0xFF,
-            0xFF,
-            0xFF,
-            0.08,
-        ))),
+        background: Some(iced::Background::Color(iced::Color::from_rgba(1.0, 1.0, 1.0, BORDER_DIVIDER))),
         ..Default::default()
     }
 }
 
 fn search_shell_style(theme: &cosmic::Theme) -> iced::widget::container::Style {
-    let bg = if theme.transparent {
-        iced::Background::Color(iced::Color::from_rgba8(0x2B, 0x2B, 0x2B, 0.70))
-    } else {
-        iced::Background::Color(iced::Color::from_rgb8(0x2B, 0x2B, 0x2B))
-    };
+    let on: iced::Color = theme.cosmic().background(false).on.into();
+
     iced::widget::container::Style {
-        background: Some(bg),
+        background: Some(iced::Background::Color(iced::Color::from_rgba(on.r, on.g, on.b, 0.05))),
+        text_color: Some(on),
         border: iced::Border {
-            radius: 24.0.into(),
+            radius: RADIUS_POPUP.into(),
             width: 1.0,
-            color: iced::Color::from_rgba8(0xFF, 0xFF, 0xFF, 0.08),
+            color: iced::Color::from_rgba(1.0, 1.0, 1.0, BORDER_GLASS_STRONG),
         },
-        ..Default::default()
-    }
-}
-
-fn icon_button_style(focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
-    widget::button::Style {
-        background: focused.then_some(iced::Background::Color(iced::Color::from_rgba8(
-            0xFF,
-            0xFF,
-            0xFF,
-            0.08,
-        ))),
-        border_radius: 12.0.into(),
-        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
-        icon_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
-        ..Default::default()
-    }
-}
-
-fn history_button_style(focused: bool, _theme: &cosmic::Theme) -> widget::button::Style {
-    widget::button::Style {
-        background: focused.then_some(iced::Background::Color(iced::Color::from_rgba8(
-            0xFF,
-            0xFF,
-            0xFF,
-            0.06,
-        ))),
-        border_radius: 8.0.into(),
-        text_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
-        icon_color: Some(iced::Color::from_rgb8(0xF3, 0xF1, 0xEC)),
         ..Default::default()
     }
 }
@@ -700,33 +925,123 @@ fn detect_kind(text: &str) -> EntryKind {
     }
 }
 
-fn clip_sub() -> Subscription<String> {
+fn clip_sub() -> Subscription<ClipData> {
     Subscription::run(|| {
         iced::stream::channel(
             100,
-            |mut out: iced::futures::channel::mpsc::Sender<String>| async move {
+            |mut out: iced::futures::channel::mpsc::Sender<ClipData>| async move {
+                // wl-paste --watch fires once on start and once per selection change.
+                // The command only prints a byte, so we stay mime-agnostic here and
+                // let read_clipboard() do the typed reads.
+                let mut child = match tokio::process::Command::new("wl-paste")
+                    .arg("--watch")
+                    .arg("sh")
+                    .arg("-c")
+                    .arg("echo x")
+                    .stdout(std::process::Stdio::piped())
+                    .spawn()
+                {
+                    Ok(child) => child,
+                    Err(e) => {
+                        tracing::error!("failed to spawn wl-paste --watch: {e}");
+                        return;
+                    }
+                };
+
+                let Some(mut stdout) = child.stdout.take() else {
+                    tracing::error!("wl-paste --watch produced no stdout");
+                    return;
+                };
+
+                let mut buf = [0u8; 64];
                 let mut last_seen = String::new();
 
                 loop {
-                    if let Ok(output) = tokio::process::Command::new("wl-paste")
-                        .arg("--no-newline")
-                        .output()
-                        .await
-                    {
-                        if output.status.success() {
-                            let text = String::from_utf8_lossy(&output.stdout).to_string();
-                            if !text.is_empty() && text != last_seen {
-                                last_seen = text.clone();
-                                let _ = out.send(text).await;
+                    match stdout.read(&mut buf).await {
+                        Ok(0) => {
+                            tracing::warn!("wl-paste --watch exited; clipboard watching stopped");
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::error!("wl-paste --watch read failed: {e}");
+                            break;
+                        }
+                        Ok(_) => {
+                            if let Some(data) = read_clipboard().await {
+                                if !data.text.is_empty() && data.text != last_seen {
+                                    last_seen = data.text.clone();
+                                    let _ = out.send(data).await;
+                                }
                             }
                         }
                     }
-
-                    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
                 }
             },
         )
     })
+}
+
+/// True when every offered mime type can be faithfully re-served by [`wl_copy`].
+/// If any type is outside [`SERVABLE_MIME_TYPES`], taking clipboard ownership
+/// would silently drop it.
+fn can_serve_mime_types(types: &str) -> bool {
+    types
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .all(|t| SERVABLE_MIME_TYPES.iter().any(|s| s.eq_ignore_ascii_case(t)))
+}
+
+async fn read_clipboard() -> Option<ClipData> {
+    let types_output = tokio::process::Command::new("wl-paste")
+        .arg("--list-types")
+        .output()
+        .await
+        .ok()?;
+    if !types_output.status.success() {
+        return None;
+    }
+    let types = String::from_utf8_lossy(&types_output.stdout);
+    let has_plain = types.lines().any(|t| t.starts_with("text/plain"));
+    let has_html = types.lines().any(|t| t.starts_with("text/html"));
+    if !has_plain && !has_html {
+        return None;
+    }
+
+    let can_serve = can_serve_mime_types(&types);
+
+    let text = if has_plain {
+        let out = tokio::process::Command::new("wl-paste")
+            .arg("--no-newline")
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout).to_string()
+    } else {
+        String::new()
+    };
+
+    let html = if has_html {
+        let out = tokio::process::Command::new("wl-paste")
+            .arg("--no-newline")
+            .arg("--type")
+            .arg("text/html")
+            .output()
+            .await
+            .ok()?;
+        if out.status.success() && out.stdout.len() <= MAX_HTML_BYTES {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Some(ClipData { text, html, can_serve })
 }
 
 fn prune_sub() -> Subscription<()> {
@@ -791,6 +1106,28 @@ fn time_ago(copied_at: DateTime<Local>) -> String {
     }
 }
 
+async fn wl_copy(text: &str, html: Option<&str>) {
+    let mut sources = vec![wl_clipboard_rs::copy::MimeSource {
+        source: wl_clipboard_rs::copy::Source::Bytes(text.as_bytes().to_vec().into()),
+        mime_type: wl_clipboard_rs::copy::MimeType::Text,
+    }];
+    if let Some(html) = html {
+        sources.push(wl_clipboard_rs::copy::MimeSource {
+            source: wl_clipboard_rs::copy::Source::Bytes(html.as_bytes().to_vec().into()),
+            mime_type: wl_clipboard_rs::copy::MimeType::Specific("text/html".to_string()),
+        });
+    }
+
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = wl_clipboard_rs::copy::copy_multi(wl_clipboard_rs::copy::Options::new(), sources)
+        {
+            tracing::warn!("wl-clipboard-rs copy_multi failed: {e}");
+        }
+    })
+    .await
+    .ok();
+}
+
 fn notify_task(summary: &'static str, body: &str, icon: &'static str) -> Task<cosmic::Action<Message>> {
     let body = body.to_string();
 
@@ -811,4 +1148,139 @@ fn notify_task(summary: &'static str, body: &str, icon: &'static str) -> Task<co
         },
         |_| cosmic::Action::None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::can_serve_mime_types;
+
+    /// Real type list from cosmic-files on a file copy
+    /// (src/clipboard.rs:27-33). Regression: we must NOT claim ownership here,
+    /// or the file payload is destroyed and Ctrl+V yields "Pasted Text.txt".
+    #[test]
+    fn cosmic_file_copy_is_not_servable() {
+        let types = "text/plain\ntext/plain;charset=utf-8\nUTF8_STRING\ntext/uri-list\nx-special/gnome-copied-files\n";
+        assert!(!can_serve_mime_types(types));
+    }
+
+    /// Real type list observed from a terminal selection on this machine.
+    #[test]
+    fn terminal_text_is_servable() {
+        let types = "text/plain;charset=utf-8\nTEXT\nUTF8_STRING\ntext/plain\nSTRING\n";
+        assert!(can_serve_mime_types(types));
+    }
+
+    #[test]
+    fn image_only_is_not_servable() {
+        assert!(!can_serve_mime_types("image/png\n"));
+    }
+
+    #[test]
+    fn text_with_html_is_servable() {
+        assert!(can_serve_mime_types("text/plain\ntext/html\n"));
+    }
+
+    #[test]
+    fn empty_and_mixed_case_are_handled() {
+        assert!(can_serve_mime_types(""));
+        assert!(can_serve_mime_types("TEXT/PLAIN\n"));
+    }
+
+    use super::{
+        count_expired_unpinned, expired_unpinned_indices, HistoryEntry, EntryKind, PRUNE_BATCH,
+    };
+    use chrono::{Duration, Local};
+    use std::collections::VecDeque;
+
+    fn entry(age_hours: i64, pinned: bool) -> HistoryEntry {
+        HistoryEntry {
+            text: format!("e{age_hours}h{}", if pinned { "p" } else { "" }),
+            html: None,
+            kind: EntryKind::Text,
+            copied_at: Local::now() - Duration::hours(age_hours),
+            pinned,
+        }
+    }
+
+    /// Newest-first, like the real deque.
+    fn history(ages: &[(i64, bool)]) -> VecDeque<HistoryEntry> {
+        VecDeque::from(ages.iter().map(|(a, p)| entry(*a, *p)).collect::<Vec<_>>())
+    }
+
+    fn cutoff() -> chrono::DateTime<Local> {
+        Local::now() - Duration::hours(48)
+    }
+
+    /// Regression for the old 0.9-ratio guard: when every unpinned entry is
+    /// expired (long absence, or a clock jump) the old code refused to prune
+    /// anything. It must now make progress instead.
+    #[test]
+    fn all_expired_still_prunes_up_to_the_cap() {
+        let h = history(&[(100, false); 500]);
+        let victims = expired_unpinned_indices(&h, cutoff());
+        assert_eq!(count_expired_unpinned(&h, cutoff()), 500);
+        assert_eq!(victims.len(), PRUNE_BATCH);
+    }
+
+    #[test]
+    fn under_cap_removes_everything_expired() {
+        let h = history(&[(1, false), (2, false), (100, false), (200, false), (300, false)]);
+        assert_eq!(expired_unpinned_indices(&h, cutoff()).len(), 3);
+    }
+
+    #[test]
+    fn nothing_expired_removes_nothing() {
+        let h = history(&[(0, false), (1, false), (10, false), (47, false)]);
+        assert!(expired_unpinned_indices(&h, cutoff()).is_empty());
+        assert_eq!(count_expired_unpinned(&h, cutoff()), 0);
+    }
+
+    #[test]
+    fn pinned_are_never_victims_even_when_old() {
+        let h = history(&[(100, true), (500, true), (900, true)]);
+        assert!(expired_unpinned_indices(&h, cutoff()).is_empty());
+        assert_eq!(count_expired_unpinned(&h, cutoff()), 0);
+    }
+
+    /// Applying the victims must leave pinned and fresh entries untouched.
+    #[test]
+    fn applying_victims_spares_pinned_and_fresh() {
+        let mut h = history(&[
+            (1, false),   // fresh, keep
+            (100, true),  // old but pinned, keep
+            (200, false), // expired, drop
+            (300, true),  // old but pinned, keep
+            (400, false), // expired, drop
+        ]);
+        for i in expired_unpinned_indices(&h, cutoff()).into_iter().rev() {
+            h.remove(i);
+        }
+        assert_eq!(h.len(), 3);
+        let texts: Vec<&str> = h.iter().map(|e| e.text.as_str()).collect();
+        assert!(texts.contains(&"e1h"));
+        assert!(texts.contains(&"e100hp"));
+        assert!(texts.contains(&"e300hp"));
+        assert!(!texts.contains(&"e200h"));
+        assert!(!texts.contains(&"e400h"));
+    }
+
+    /// Repeated passes must converge — the whole point of capping.
+    #[test]
+    fn repeated_passes_converge() {
+        let mut h = history(&[(100, false); 500]);
+        let mut passes = 0;
+        while count_expired_unpinned(&h, cutoff()) > 0 {
+            let v = expired_unpinned_indices(&h, cutoff());
+            if v.is_empty() {
+                break;
+            }
+            for i in v.into_iter().rev() {
+                h.remove(i);
+            }
+            passes += 1;
+            assert!(passes < 10, "should converge in a few passes");
+        }
+        assert!(h.is_empty());
+        assert_eq!(passes, 3); // 500 / 200 -> 200, 200, 100
+    }
 }
