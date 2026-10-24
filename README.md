@@ -25,8 +25,18 @@ Images and file copies are **not** recorded, but they're left untouched so pasti
 | `Enter` | Copy the selected entry (or the first result) |
 | `Ctrl+F` | Focus the search field |
 | `Esc` | Clear search, then close the popup |
+| `Super+V` | Open the popup (COSMIC custom shortcut) |
 
 Click the gear in the popup footer to change the panel display mode.
+
+### Super+V global shortcut
+
+COSMIC global shortcuts are configured by the compositor, not by the applet. To open the popup with `Super+V`, add a custom shortcut in **COSMIC Settings** that runs:
+
+- Shortcut: `Super+V`
+- Command: `pkill -USR1 -x clipManager`
+
+The applet listens for `SIGUSR1` and toggles the popup.
 
 ## Install
 
@@ -53,5 +63,5 @@ Settings live in `config.json` in the same directory. Delete them to reset.
 Private mode resets on restart.
 
 ```bash
-cargo test    # 19 tests
+cargo test    # 21 tests
 ```

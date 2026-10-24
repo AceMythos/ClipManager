@@ -18,6 +18,7 @@ const MAX_AGE_HOURS: i64 = 48;
 const PRUNE_BATCH: usize = 200;
 const NOTIFICATION_ID: &str = "41042";
 const SEARCH_INPUT_ID: &str = "clipboard-search";
+const SCROLL_ID: &str = "clipboard-scroll";
 /// Rapid copies inside this window collapse into a single disk write.
 const SAVE_DEBOUNCE_MS: u64 = 800;
 const PANEL_PREVIEW_CHARS: usize = 14;
@@ -56,6 +57,11 @@ const BORDER_DIVIDER: f32 = 0.06;
 const SPACING_OUTER: f32 = 16.0;
 const SPACING_CARDS: u16 = 12;
 const SPACING_SEARCH: f32 = 42.0;
+const ROW_HEIGHT: f32 = 72.0;
+const SECTION_HEIGHT: f32 = 46.0;
+const DIVIDER_HEIGHT: f32 = 1.0;
+/// Used until the scrollable reports its real viewport height.
+const LIST_VIEWPORT_FALLBACK: f32 = 487.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -123,6 +129,8 @@ pub struct AppModel {
     panel_display: PanelDisplay,
     settings_open: bool,
     selected: Option<usize>,
+    scroll_offset: f32,
+    viewport_height: Option<f32>,
     save_generation: u64,
 }
 
@@ -142,6 +150,7 @@ pub enum Message {
     MoveSelection(i32),
     ActivateSelected,
     FocusSearch,
+    Scrolled { offset: f32, viewport_height: f32 },
     HistoryLoaded(Vec<HistoryEntry>),
     ConfigLoaded(crate::storage::Config),
     SetPanelDisplay(PanelDisplay),
@@ -263,7 +272,9 @@ impl cosmic::Application for AppModel {
                 if has_normal && !entry.pinned && !added_normal {
                     if added_pinned {
                         let div = widget::container(
-                            widget::Space::new().width(Length::Fill).height(Length::Fixed(1.0)),
+                            widget::Space::new()
+                                .width(Length::Fill)
+                                .height(Length::Fixed(DIVIDER_HEIGHT)),
                         )
                         .width(Length::Fill)
                         .padding([0, 12])
@@ -280,6 +291,11 @@ impl cosmic::Application for AppModel {
         let scrollable = widget::scrollable(
             widget::column::with_children(list_children).spacing(SPACING_CARDS),
         )
+        .id(cosmic::iced::core::id::Id::new(SCROLL_ID))
+        .on_scroll(|viewport| Message::Scrolled {
+            offset: viewport.absolute_offset().y,
+            viewport_height: viewport.bounds().height,
+        })
         .height(Length::Fill)
         .width(Length::Fill)
         .class(theme::style::iced::Scrollable::Minimal);
@@ -314,6 +330,7 @@ impl cosmic::Application for AppModel {
             clip_sub().map(Message::ClipChanged),
             prune_sub().map(|_| Message::PruneTimer),
             key_sub(),
+            signal_sub(),
         ])
     }
 
@@ -502,12 +519,25 @@ impl cosmic::Application for AppModel {
                 self.confirm_clear = false;
             }
             Message::Escape => {
+                if self.popup.is_none() {
+                    return Task::none();
+                }
                 if self.settings_open {
                     self.settings_open = false;
-                } else if !self.search.is_empty() {
+                    return widget::text_input::focus(cosmic::iced::core::id::Id::new(
+                        SEARCH_INPUT_ID,
+                    ))
+                    .map(cosmic::Action::App);
+                }
+                if !self.search.is_empty() {
                     self.search.clear();
                     self.selected = None;
-                } else if let Some(id) = self.popup.take() {
+                    return widget::text_input::focus(cosmic::iced::core::id::Id::new(
+                        SEARCH_INPUT_ID,
+                    ))
+                    .map(cosmic::Action::App);
+                }
+                if let Some(id) = self.popup.take() {
                     self.confirm_clear = false;
                     return cosmic::iced::platform_specific::shell::commands::popup::destroy_popup(
                         id,
@@ -516,7 +546,16 @@ impl cosmic::Application for AppModel {
             }
             Message::MoveSelection(delta) => {
                 if self.popup.is_some() && !self.settings_open {
-                    self.move_selection(delta);
+                    if let Some(target) = self.move_selection(delta) {
+                        return cosmic::iced::widget::scrollable::scroll_to(
+                            cosmic::iced::core::id::Id::new(SCROLL_ID),
+                            cosmic::iced::widget::scrollable::AbsoluteOffset {
+                                x: None,
+                                y: Some(target),
+                            },
+                        )
+                        .map(cosmic::Action::App);
+                    }
                 }
             }
             Message::ActivateSelected => {
@@ -543,6 +582,13 @@ impl cosmic::Application for AppModel {
                     ))
                     .map(cosmic::Action::App);
                 }
+            }
+            Message::Scrolled {
+                offset,
+                viewport_height,
+            } => {
+                self.scroll_offset = offset;
+                self.viewport_height = Some(viewport_height);
             }
             Message::HistoryLoaded(entries) => {
                 self.history = VecDeque::from(entries);
@@ -634,16 +680,21 @@ impl AppModel {
         }
     }
 
-    fn move_selection(&mut self, delta: i32) {
-        let visible: Vec<usize> = self
-            .filtered_entries()
-            .iter()
-            .map(|(index, _)| *index)
-            .collect();
+    fn move_selection(&mut self, delta: i32) -> Option<f32> {
+        let (visible, layout) = {
+            let entries = self.filtered_entries();
+            (
+                entries.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+                entries
+                    .iter()
+                    .map(|(index, entry)| (*index, entry.pinned))
+                    .collect::<Vec<_>>(),
+            )
+        };
 
         if visible.is_empty() {
             self.selected = None;
-            return;
+            return None;
         }
 
         let next = match self
@@ -657,7 +708,20 @@ impl AppModel {
             None => visible.len() - 1,
         };
 
-        self.selected = Some(visible[next]);
+        let selected = visible[next];
+        let top = row_offset(&layout, selected);
+        self.selected = Some(selected);
+        let top = top?;
+        let viewport = self.viewport_height.unwrap_or(LIST_VIEWPORT_FALLBACK);
+        let bottom = top + ROW_HEIGHT;
+
+        if top < self.scroll_offset {
+            Some(top)
+        } else if bottom > self.scroll_offset + viewport {
+            Some(bottom - viewport)
+        } else {
+            None
+        }
     }
 
     fn schedule_save(&mut self) -> Task<cosmic::Action<Message>> {
@@ -1007,9 +1071,52 @@ impl AppModel {
             .align_y(Alignment::Center),
         )
         .width(Length::Fill)
+        .height(Length::Fixed(ROW_HEIGHT))
         .style(move |theme| card_style(theme, is_selected))
         .into()
     }
+}
+
+fn row_offset(entries: &[(usize, bool)], target: usize) -> Option<f32> {
+    let has_pinned = entries.iter().any(|(_, pinned)| *pinned);
+    let has_normal = entries.iter().any(|(_, pinned)| !*pinned);
+    let mut y = 0.0;
+    let mut first = true;
+    let mut added_pinned = false;
+    let mut added_normal = false;
+
+    for (index, pinned) in entries {
+        if has_pinned && *pinned && !added_pinned {
+            add_item(&mut y, &mut first, SECTION_HEIGHT);
+            added_pinned = true;
+        }
+        if has_normal && !*pinned && !added_normal {
+            if added_pinned {
+                add_item(&mut y, &mut first, DIVIDER_HEIGHT);
+            }
+            add_item(&mut y, &mut first, SECTION_HEIGHT);
+            added_normal = true;
+        }
+
+        if !first {
+            y += SPACING_CARDS as f32;
+        }
+        if *index == target {
+            return Some(y);
+        }
+        y += ROW_HEIGHT;
+        first = false;
+    }
+
+    None
+}
+
+fn add_item(y: &mut f32, first: &mut bool, height: f32) {
+    if !*first {
+        *y += SPACING_CARDS as f32;
+    }
+    *y += height;
+    *first = false;
 }
 
 fn popup_limits() -> iced::Limits {
@@ -1087,6 +1194,7 @@ fn section_header(label: &'static str) -> Element<'static, Message> {
     )
     .padding([18, 12, 8, 12])
     .width(Length::Fill)
+    .height(Length::Fixed(SECTION_HEIGHT))
     .style(|theme| {
         let on: iced::Color = theme.cosmic().background(false).on.into();
         iced::widget::container::Style {
@@ -1338,6 +1446,31 @@ fn prune_sub() -> Subscription<()> {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
                     let _ = out.send(()).await;
+                }
+            },
+        )
+    })
+}
+
+fn signal_sub() -> Subscription<Message> {
+    Subscription::run(|| {
+        iced::stream::channel(
+            1,
+            |mut out: iced::futures::channel::mpsc::Sender<Message>| async move {
+                let mut signal = match tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::user_defined1(),
+                ) {
+                    Ok(signal) => signal,
+                    Err(e) => {
+                        tracing::error!("failed to listen for SIGUSR1: {e}");
+                        return;
+                    }
+                };
+
+                while signal.recv().await.is_some() {
+                    if out.send(Message::TogglePopup).await.is_err() {
+                        break;
+                    }
                 }
             },
         )
@@ -1628,5 +1761,23 @@ mod tests {
         }
         assert!(h.is_empty());
         assert_eq!(passes, 3); // 500 / 200 -> 200, 200, 100
+    }
+
+    use super::row_offset;
+
+    #[test]
+    fn row_offset_without_pinned() {
+        let layout = [(0, false), (1, false), (2, false)];
+        assert_eq!(row_offset(&layout, 0), Some(58.0));
+        assert_eq!(row_offset(&layout, 1), Some(142.0));
+        assert_eq!(row_offset(&layout, 2), Some(226.0));
+    }
+
+    #[test]
+    fn row_offset_with_pinned_and_recent() {
+        let layout = [(0, true), (1, true), (2, false)];
+        assert_eq!(row_offset(&layout, 0), Some(58.0));
+        assert_eq!(row_offset(&layout, 1), Some(142.0));
+        assert_eq!(row_offset(&layout, 2), Some(297.0));
     }
 }
