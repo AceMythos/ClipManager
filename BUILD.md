@@ -3,20 +3,40 @@
 ## Build
 
 ```bash
-## cargo clean if theres a binary and then rm applet traces from usr bin and usr share applications
+cargo build --release
+cargo test
+cargo clippy --all-targets -- -D warnings
+```
+
+## Clean rebuild
+
+Remove the installed binary and desktop entry first, then rebuild from scratch:
+
+```bash
+pkexec rm -f /usr/bin/clipManager
+pkexec rm -f /usr/share/applications/clipManager.desktop
+cargo clean
 cargo build --release
 ```
 
-## Install (add to panel)
+> `pkexec` resets the working directory. Pass absolute paths to it, and run
+> `cargo` separately from the project root as shown above.
+
+## Install
 
 ```bash
-pkexec install -m 755 target/release/clipManager /usr/bin/clipManager
-pkexec cp "$PWD/clipManager.desktop" /usr/share/applications/
+pkexec install -m 755 "$PWD/target/release/clipManager" /usr/bin/clipManager
+pkexec install -m 644 "$PWD/clipManager.desktop" /usr/share/applications/clipManager.desktop
 ```
 
-> `pkexec` resets the working directory, so always run these from the project root or use absolute paths.
+Verify the installed files:
 
-Then add via **COSMIC Settings > Desktop > Panel**.
+```bash
+ls -l /usr/bin/clipManager /usr/share/applications/clipManager.desktop
+```
+
+Then add it via **COSMIC Settings > Desktop > Panel**, or restart the panel so it
+picks up the new binary.
 
 ## Requirements
 

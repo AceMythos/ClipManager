@@ -1,9 +1,9 @@
 use chrono::{DateTime, Duration, Local};
+use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
 use cosmic::{
     app::Core,
     iced::{self, futures::SinkExt, Alignment, Length, Subscription},
-    theme,
-    widget, Element, Task,
+    theme, widget, Element, Task,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -17,9 +17,13 @@ const MAX_AGE_HOURS: i64 = 48;
 /// we cap the blast radius and converge over a few passes.
 const PRUNE_BATCH: usize = 200;
 const NOTIFICATION_ID: &str = "41042";
+const SEARCH_INPUT_ID: &str = "clipboard-search";
+/// Rapid copies inside this window collapse into a single disk write.
+const SAVE_DEBOUNCE_MS: u64 = 800;
 const PANEL_PREVIEW_CHARS: usize = 14;
 const POPUP_PREVIEW_CHARS: usize = 120;
-const POPUP_WIDTH: f32 = 920.0;
+const POPUP_WIDTH_MIN: f32 = 360.0;
+const POPUP_WIDTH_MAX: f32 = 560.0;
 const POPUP_HEIGHT: f32 = 640.0;
 const MAX_HTML_BYTES: usize = 1024 * 1024;
 
@@ -78,7 +82,6 @@ pub enum EntryKind {
     Url,
     Command,
     Code,
-    Image,
     File,
     Color,
     Email,
@@ -91,7 +94,6 @@ impl EntryKind {
             EntryKind::Url => "Link",
             EntryKind::Command => "Command",
             EntryKind::Code => "Code",
-            EntryKind::Image => "Image",
             EntryKind::File => "File",
             EntryKind::Color => "Color",
             EntryKind::Email => "Email",
@@ -99,6 +101,17 @@ impl EntryKind {
     }
 }
 
+/// How the applet renders itself in the COSMIC panel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PanelDisplay {
+    /// Icon plus a short preview of the newest copy.
+    #[default]
+    IconAndText,
+    /// Icon only; hovering still opens the popup.
+    IconOnly,
+}
+
+#[derive(Default)]
 pub struct AppModel {
     core: Core,
     popup: Option<iced::window::Id>,
@@ -107,20 +120,10 @@ pub struct AppModel {
     search: String,
     private_mode: bool,
     confirm_clear: bool,
-}
-
-impl Default for AppModel {
-    fn default() -> Self {
-        Self {
-            core: Core::default(),
-            popup: None,
-            history: VecDeque::new(),
-            current: String::new(),
-            search: String::new(),
-            private_mode: false,
-            confirm_clear: false,
-        }
-    }
+    panel_display: PanelDisplay,
+    settings_open: bool,
+    selected: Option<usize>,
+    save_generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +137,15 @@ pub enum Message {
     ClearHistory,
     SearchChanged(String),
     TogglePrivateMode,
+    ToggleSettings,
+    Escape,
+    MoveSelection(i32),
+    ActivateSelected,
+    FocusSearch,
     HistoryLoaded(Vec<HistoryEntry>),
+    ConfigLoaded(crate::storage::Config),
+    SetPanelDisplay(PanelDisplay),
+    SaveHistory(u64, Vec<HistoryEntry>),
     PruneTimer,
 }
 
@@ -154,10 +165,14 @@ impl cosmic::Application for AppModel {
 
     fn init(core: Core, _flags: Self::Flags) -> (Self, Task<cosmic::Action<Self::Message>>) {
         let app = Self { core, ..Default::default() };
-        let task = Task::perform(
-            async { crate::storage::load_history().await },
-            |entries| cosmic::Action::from(Message::HistoryLoaded(entries)),
-        );
+        let task = Task::batch(vec![
+            Task::perform(async { crate::storage::load_history().await }, |entries| {
+                cosmic::Action::from(Message::HistoryLoaded(entries))
+            }),
+            Task::perform(async { crate::storage::load_config().await }, |config| {
+                cosmic::Action::from(Message::ConfigLoaded(config))
+            }),
+        ]);
         (app, task)
     }
 
@@ -167,15 +182,33 @@ impl cosmic::Application for AppModel {
 
     fn view(&self) -> Element<'_, Self::Message> {
         let suggested = self.core.applet.suggested_size(false);
-        let icon = widget::icon::from_name("edit-paste-symbolic")
-            .size(suggested.1.saturating_sub(4));
+        let icon_name = if self.private_mode {
+            "security-high-symbolic"
+        } else {
+            "edit-paste-symbolic"
+        };
+        let icon = widget::icon::from_name(icon_name).size(suggested.1.saturating_sub(4));
 
-        let preview = widget::text::caption(panel_preview(&self.current)).size(12);
-        let content = widget::row::with_children(vec![icon.into(), preview.into()])
-            .spacing(6)
-            .align_y(Alignment::Center);
+        let content: Element<'_, Message> = match self.panel_display {
+            PanelDisplay::IconOnly => icon.into(),
+            PanelDisplay::IconAndText => {
+                let preview = if self.private_mode {
+                    "Private".to_string()
+                } else {
+                    panel_preview(&self.current)
+                };
+                widget::row::with_children(vec![
+                    icon.into(),
+                    widget::text::caption(preview).size(12).into(),
+                ])
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into()
+            }
+        };
 
-        let btn = self.core
+        let btn = self
+            .core
             .applet
             .button_from_element(content, true)
             .width(Length::Shrink)
@@ -185,9 +218,14 @@ impl cosmic::Application for AppModel {
     }
 
     fn view_window(&self, _id: iced::window::Id) -> Element<'_, Self::Message> {
+        if self.settings_open {
+            return self.settings_view();
+        }
+
         let filtered_entries = self.filtered_entries();
 
         let search = widget::text_input::text_input("Type here to search...", &self.search)
+            .id(cosmic::iced::core::id::Id::new(SEARCH_INPUT_ID))
             .on_input(Message::SearchChanged)
             .padding([12, 16])
             .size(14)
@@ -259,10 +297,11 @@ impl cosmic::Application for AppModel {
             .popup_container(
                 widget::container(content)
                     .padding(SPACING_OUTER)
-                    .width(Length::Fixed(POPUP_WIDTH))
+                    .width(Length::Fill)
                     .height(Length::Fixed(POPUP_HEIGHT))
                     .style(popup_style),
             )
+            .limits(popup_limits())
             .into()
     }
 
@@ -274,6 +313,7 @@ impl cosmic::Application for AppModel {
         Subscription::batch(vec![
             clip_sub().map(Message::ClipChanged),
             prune_sub().map(|_| Message::PruneTimer),
+            key_sub(),
         ])
     }
 
@@ -286,6 +326,8 @@ impl cosmic::Application for AppModel {
 
                 let new_id = iced::window::Id::unique();
                 self.popup.replace(new_id);
+                self.search.clear();
+                self.selected = None;
 
                 let Some(main_window_id) = self.core.main_window_id() else {
                     tracing::error!("no main window id; cannot open popup");
@@ -296,26 +338,27 @@ impl cosmic::Application for AppModel {
                 let mut settings = self.core.applet.get_popup_settings(
                     main_window_id,
                     new_id,
-                    Some((POPUP_WIDTH as u32, POPUP_HEIGHT as u32)),
+                    Some((POPUP_WIDTH_MAX as u32, POPUP_HEIGHT as u32)),
                     None,
                     None,
                 );
-                settings.positioner.size_limits = iced::Limits::NONE
-                    .min_width(POPUP_WIDTH)
-                    .max_width(POPUP_WIDTH)
-                    .min_height(POPUP_HEIGHT)
-                    .max_height(POPUP_HEIGHT);
+                settings.positioner.size_limits = popup_limits();
 
                 let mut tasks = vec![
                     cosmic::iced::platform_specific::shell::commands::popup::get_popup(settings),
                 ];
                 tasks.push(iced::window::enable_blur(new_id));
+                tasks.push(
+                    widget::text_input::focus(cosmic::iced::core::id::Id::new(SEARCH_INPUT_ID))
+                        .map(cosmic::Action::App),
+                );
                 return Task::batch(tasks);
             }
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
                     self.confirm_clear = false;
+                    self.settings_open = false;
                 }
             }
             Message::ClipChanged(data) => {
@@ -325,6 +368,7 @@ impl cosmic::Application for AppModel {
                 }
 
                 self.current = cleaned.clone();
+                self.selected = None;
 
                 if self.private_mode {
                     return Task::none();
@@ -373,7 +417,7 @@ impl cosmic::Application for AppModel {
                 };
 
                 return Task::batch(vec![
-                    self.schedule_save(),
+                    self.schedule_save_debounced(),
                     notify_task("Copied to clipboard", &entry_preview(&self.current), "edit-paste-symbolic"),
                     claim_clipboard,
                 ]);
@@ -403,6 +447,7 @@ impl cosmic::Application for AppModel {
                     if let Some(entry) = self.history.get_mut(i) {
                         entry.pinned = new_pinned;
                     }
+                    self.selected = None;
                     return Task::batch(vec![
                         self.schedule_save(),
                         notify_task(summary, &body, icon),
@@ -411,6 +456,7 @@ impl cosmic::Application for AppModel {
                 return self.schedule_save();
             }
             Message::DeleteEntry(i) => {
+                self.selected = None;
                 let is_pinned = self.history.get(i).is_some_and(|e| e.pinned);
                 if !is_pinned {
                     if let Some(removed) = self.history.remove(i) {
@@ -428,6 +474,7 @@ impl cosmic::Application for AppModel {
             Message::ClearHistory => {
                 if self.confirm_clear {
                     self.history.retain(|e| e.pinned);
+                    self.selected = None;
                     if !self.history.iter().any(|e| e.text == self.current) {
                         self.current.clear();
                     }
@@ -445,12 +492,61 @@ impl cosmic::Application for AppModel {
             Message::SearchChanged(value) => {
                 self.search = value;
                 self.confirm_clear = false;
+                self.selected = None;
             }
             Message::TogglePrivateMode => {
                 self.private_mode = !self.private_mode;
             }
+            Message::ToggleSettings => {
+                self.settings_open = !self.settings_open;
+                self.confirm_clear = false;
+            }
+            Message::Escape => {
+                if self.settings_open {
+                    self.settings_open = false;
+                } else if !self.search.is_empty() {
+                    self.search.clear();
+                    self.selected = None;
+                } else if let Some(id) = self.popup.take() {
+                    self.confirm_clear = false;
+                    return cosmic::iced::platform_specific::shell::commands::popup::destroy_popup(
+                        id,
+                    );
+                }
+            }
+            Message::MoveSelection(delta) => {
+                if self.popup.is_some() && !self.settings_open {
+                    self.move_selection(delta);
+                }
+            }
+            Message::ActivateSelected => {
+                if self.popup.is_none() || self.settings_open {
+                    return Task::none();
+                }
+                let index = self
+                    .selected
+                    .or_else(|| self.filtered_entries().first().map(|(index, _)| *index));
+                if let Some(index) = index {
+                    let close = self
+                        .popup
+                        .take()
+                        .map(cosmic::iced::platform_specific::shell::commands::popup::destroy_popup)
+                        .unwrap_or_else(Task::none);
+                    let activate = self.update(Message::ActivateEntry(index));
+                    return Task::batch(vec![activate, close]);
+                }
+            }
+            Message::FocusSearch => {
+                if self.popup.is_some() && !self.settings_open {
+                    return widget::text_input::focus(cosmic::iced::core::id::Id::new(
+                        SEARCH_INPUT_ID,
+                    ))
+                    .map(cosmic::Action::App);
+                }
+            }
             Message::HistoryLoaded(entries) => {
                 self.history = VecDeque::from(entries);
+                self.selected = None;
                 let needs_save = self.prune_expired();
                 self.current = self
                     .history
@@ -459,6 +555,27 @@ impl cosmic::Application for AppModel {
                     .unwrap_or_default();
                 if needs_save {
                     return self.schedule_save();
+                }
+            }
+            Message::ConfigLoaded(config) => {
+                self.panel_display = config.panel_display;
+            }
+            Message::SetPanelDisplay(display) => {
+                self.panel_display = display;
+                let config = crate::storage::Config {
+                    panel_display: display,
+                };
+                return Task::perform(
+                    async move { crate::storage::save_config(config).await },
+                    |_| cosmic::Action::None,
+                );
+            }
+            Message::SaveHistory(generation, entries) => {
+                if generation == self.save_generation {
+                    return Task::perform(
+                        async move { crate::storage::save_history(&entries).await },
+                        |_| cosmic::Action::None,
+                    );
                 }
             }
         }
@@ -517,11 +634,53 @@ impl AppModel {
         }
     }
 
-    fn schedule_save(&self) -> Task<cosmic::Action<Message>> {
+    fn move_selection(&mut self, delta: i32) {
+        let visible: Vec<usize> = self
+            .filtered_entries()
+            .iter()
+            .map(|(index, _)| *index)
+            .collect();
+
+        if visible.is_empty() {
+            self.selected = None;
+            return;
+        }
+
+        let next = match self
+            .selected
+            .and_then(|selected| visible.iter().position(|index| *index == selected))
+        {
+            Some(position) => {
+                (position as i32 + delta).clamp(0, visible.len() as i32 - 1) as usize
+            }
+            None if delta > 0 => 0,
+            None => visible.len() - 1,
+        };
+
+        self.selected = Some(visible[next]);
+    }
+
+    fn schedule_save(&mut self) -> Task<cosmic::Action<Message>> {
+        self.save_generation = self.save_generation.wrapping_add(1);
         let entries: Vec<HistoryEntry> = self.history.iter().cloned().collect();
         Task::perform(
             async move { crate::storage::save_history(&entries).await },
             |_| cosmic::Action::None,
+        )
+    }
+
+    /// Coalesce rapid copies into one disk write. The newest schedule wins;
+    /// older snapshots are dropped once their generation no longer matches.
+    fn schedule_save_debounced(&mut self) -> Task<cosmic::Action<Message>> {
+        self.save_generation = self.save_generation.wrapping_add(1);
+        let generation = self.save_generation;
+        let entries: Vec<HistoryEntry> = self.history.iter().cloned().collect();
+        Task::perform(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(SAVE_DEBOUNCE_MS)).await;
+                (generation, entries)
+            },
+            |(generation, entries)| cosmic::Action::from(Message::SaveHistory(generation, entries)),
         )
     }
 
@@ -628,6 +787,10 @@ impl AppModel {
             private_toggle.into(),
             widget::Space::new().width(Length::Fixed(12.0)).into(),
             icon_button(trash_icon, false).on_press(Message::ClearHistory).into(),
+            widget::Space::new().width(Length::Fixed(4.0)).into(),
+            icon_button("emblem-system-symbolic", false)
+                .on_press(Message::ToggleSettings)
+                .into(),
         ])
         .align_y(Alignment::Center);
 
@@ -641,13 +804,66 @@ impl AppModel {
         .into()
     }
 
+    fn settings_view(&self) -> Element<'_, Message> {
+        let back = widget::button::custom(
+            widget::row::with_children(vec![
+                widget::icon::from_name("go-previous-symbolic").size(16).into(),
+                widget::text::body("Settings").size(16).into(),
+            ])
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding([8, 12])
+        .class(theme::Button::Text)
+        .on_press(Message::ToggleSettings);
+
+        let preview_on = matches!(self.panel_display, PanelDisplay::IconAndText);
+        let panel_toggle = widget::settings::item(
+            "Show preview text in panel",
+            widget::toggler(preview_on).on_toggle(|on| {
+                Message::SetPanelDisplay(if on {
+                    PanelDisplay::IconAndText
+                } else {
+                    PanelDisplay::IconOnly
+                })
+            }),
+        );
+
+        let hint = widget::container(
+            widget::text::caption("The panel icon opens this popup in both modes.").size(12),
+        )
+        .padding([0, 12]);
+
+        let content = widget::column::with_children(vec![
+            back.into(),
+            widget::Space::new().height(Length::Fixed(8.0)).into(),
+            panel_toggle.into(),
+            hint.into(),
+        ]);
+
+        self.core
+            .applet
+            .popup_container(
+                widget::container(content)
+                    .padding(SPACING_OUTER)
+                    .width(Length::Fill)
+                    .height(Length::Fixed(POPUP_HEIGHT))
+                    .style(popup_style),
+            )
+            .limits(popup_limits())
+            .into()
+    }
+
     fn history_row(&self, entry: &HistoryEntry, index: usize) -> Element<'_, Message> {
         let is_active = entry.text == self.current;
+        let is_selected = self.selected == Some(index);
 
         let text_column = widget::column::with_children(vec![
             widget::text::body(entry_preview(&entry.text))
                 .size(15)
                 .width(Length::Fill)
+                .wrapping(Wrapping::None)
+                .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
                 .into(),
             widget::Space::new().height(Length::Fixed(4.0)).into(),
             widget::container(
@@ -675,6 +891,27 @@ impl AppModel {
             "cpin-outline-symbolic"
         };
 
+        let dot = widget::container(
+            widget::Space::new()
+                .width(Length::Fixed(6.0))
+                .height(Length::Fixed(6.0)),
+        )
+        .style(move |theme: &cosmic::Theme| {
+            let accent: iced::Color = theme.cosmic().accent.base.into();
+            iced::widget::container::Style {
+                background: Some(iced::Background::Color(if is_active {
+                    accent
+                } else {
+                    iced::Color::TRANSPARENT
+                })),
+                border: iced::Border {
+                    radius: 3.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        });
+
         let mut action_children: Vec<Element<_>> = vec![
             icon_button(pin_icon, entry.pinned).on_press(Message::TogglePin(index)).into(),
         ];
@@ -686,11 +923,9 @@ impl AppModel {
             .align_y(Alignment::Center);
 
         let activate = widget::button::custom(
-            widget::row::with_children(vec![
-                text_column.into(),
-            ])
-            .spacing(12)
-            .align_y(Alignment::Center),
+            widget::row::with_children(vec![dot.into(), text_column.into()])
+                .spacing(10)
+                .align_y(Alignment::Center),
         )
         .padding([12, 16])
         .width(Length::Fill)
@@ -732,14 +967,13 @@ impl AppModel {
                 let cosmic = theme.cosmic();
                 let on: iced::Color = cosmic.background(false).on.into();
                 let base: iced::Color = cosmic.background(theme.transparent).base.into();
-                let (r, g, b) = if is_active {
-                    (base.r * CARD_LUM_HOVER, base.g * CARD_LUM_HOVER, base.b * CARD_LUM_HOVER)
-                } else {
-                    (base.r * CARD_LUM_HOVER, base.g * CARD_LUM_HOVER, base.b * CARD_LUM_HOVER)
-                };
-                let alpha = if is_active { OPACITY_CARD_HOVER } else { OPACITY_CARD_HOVER };
                 widget::button::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgba(r, g, b, alpha))),
+                    background: Some(iced::Background::Color(iced::Color::from_rgba(
+                        base.r * CARD_LUM_HOVER,
+                        base.g * CARD_LUM_HOVER,
+                        base.b * CARD_LUM_HOVER,
+                        OPACITY_CARD_HOVER,
+                    ))),
                     border_radius: RADIUS_CARD.into(),
                     shadow_offset: iced::Vector::new(0.0, 2.0),
                     text_color: Some(on),
@@ -773,14 +1007,23 @@ impl AppModel {
             .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .style(card_default)
+        .style(move |theme| card_style(theme, is_selected))
         .into()
     }
 }
 
-fn card_default(theme: &cosmic::Theme) -> iced::widget::container::Style {
+fn popup_limits() -> iced::Limits {
+    iced::Limits::NONE
+        .min_width(POPUP_WIDTH_MIN)
+        .max_width(POPUP_WIDTH_MAX)
+        .min_height(POPUP_HEIGHT)
+        .max_height(POPUP_HEIGHT)
+}
+
+fn card_style(theme: &cosmic::Theme, selected: bool) -> iced::widget::container::Style {
     let cosmic = theme.cosmic();
     let base: iced::Color = cosmic.background(theme.transparent).base.into();
+    let accent: iced::Color = cosmic.accent.base.into();
     iced::widget::container::Style {
         background: Some(iced::Background::Color(iced::Color::from_rgba(
             base.r * CARD_LUM_DARKEN,
@@ -790,8 +1033,12 @@ fn card_default(theme: &cosmic::Theme) -> iced::widget::container::Style {
         ))),
         border: iced::Border {
             radius: RADIUS_CARD.into(),
-            width: 0.0,
-            color: iced::Color::TRANSPARENT,
+            width: if selected { 1.0 } else { 0.0 },
+            color: if selected {
+                accent
+            } else {
+                iced::Color::TRANSPARENT
+            },
         },
         ..Default::default()
     }
@@ -931,19 +1178,52 @@ fn detect_kind(text: &str) -> EntryKind {
     }
 }
 
+fn key_sub() -> Subscription<Message> {
+    use cosmic::iced::{
+        event::{self, Event},
+        keyboard::{key::Named, Event as KeyboardEvent, Key},
+    };
+
+    event::listen_raw(|event, _status, _window| {
+        let Event::Keyboard(KeyboardEvent::KeyPressed { key, modifiers, .. }) = event else {
+            return None;
+        };
+
+        match key {
+            Key::Named(Named::Escape) => Some(Message::Escape),
+            Key::Named(Named::ArrowUp) => Some(Message::MoveSelection(-1)),
+            Key::Named(Named::ArrowDown) => Some(Message::MoveSelection(1)),
+            Key::Named(Named::Enter) => Some(Message::ActivateSelected),
+            Key::Character(c) if modifiers.control() && c.eq_ignore_ascii_case("n") => {
+                Some(Message::MoveSelection(1))
+            }
+            Key::Character(c) if modifiers.control() && c.eq_ignore_ascii_case("p") => {
+                Some(Message::MoveSelection(-1))
+            }
+            Key::Character(c) if modifiers.control() && c.eq_ignore_ascii_case("f") => {
+                Some(Message::FocusSearch)
+            }
+            _ => None,
+        }
+    })
+}
+
 fn clip_sub() -> Subscription<ClipData> {
     Subscription::run(|| {
         iced::stream::channel(
             100,
             |mut out: iced::futures::channel::mpsc::Sender<ClipData>| async move {
                 // wl-paste --watch fires once on start and once per selection change.
-                // The command only prints a byte, so we stay mime-agnostic here and
-                // let read_clipboard() do the typed reads.
+                // The command must drain stdin: wl-paste feeds it the clipboard data,
+                // and exiting early closes the transfer fd. The clipboard owner then
+                // gets EPIPE, which wl-clipboard-rs treats as fatal and drops the
+                // selection (clearing the clipboard). After draining, print a byte so
+                // the watcher loop below still gets one trigger per change.
                 let mut child = match tokio::process::Command::new("wl-paste")
                     .arg("--watch")
                     .arg("sh")
                     .arg("-c")
-                    .arg("echo x")
+                    .arg("cat >/dev/null; echo x")
                     .stdout(std::process::Stdio::piped())
                     .spawn()
                 {
@@ -1098,17 +1378,30 @@ fn entry_preview(text: &str) -> String {
 }
 
 fn time_ago(copied_at: DateTime<Local>) -> String {
-    let now = Local::now();
+    time_ago_at(Local::now(), copied_at)
+}
+
+/// Pure so the singular/plural edge cases are testable without a clock.
+fn time_ago_at(now: DateTime<Local>, copied_at: DateTime<Local>) -> String {
     let duration = now.signed_duration_since(copied_at);
 
-    if duration.num_minutes() < 1 {
+    if duration.num_seconds() < 60 {
+        // Also covers a negative duration: the entry claims to be from the future.
         "just now".to_string()
     } else if duration.num_minutes() < 60 {
-        format!("{} minutes ago", duration.num_minutes())
+        relative(duration.num_minutes(), "minute")
     } else if duration.num_hours() < 24 {
-        format!("{} hours ago", duration.num_hours())
+        relative(duration.num_hours(), "hour")
     } else {
-        format!("{} days ago", duration.num_days())
+        relative(duration.num_days(), "day")
+    }
+}
+
+fn relative(amount: i64, unit: &str) -> String {
+    if amount == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{amount} {unit}s ago")
     }
 }
 
@@ -1222,6 +1515,28 @@ mod tests {
     };
     use chrono::{Duration, Local};
     use std::collections::VecDeque;
+
+    #[test]
+    fn time_ago_singular_and_plural() {
+        use super::time_ago_at;
+
+        let now = Local::now();
+        assert_eq!(time_ago_at(now, now), "just now");
+        assert_eq!(time_ago_at(now, now - Duration::minutes(1)), "1 minute ago");
+        assert_eq!(time_ago_at(now, now - Duration::minutes(2)), "2 minutes ago");
+        assert_eq!(time_ago_at(now, now - Duration::hours(1)), "1 hour ago");
+        assert_eq!(time_ago_at(now, now - Duration::hours(2)), "2 hours ago");
+        assert_eq!(time_ago_at(now, now - Duration::days(1)), "1 day ago");
+        assert_eq!(time_ago_at(now, now - Duration::days(3)), "3 days ago");
+    }
+
+    #[test]
+    fn time_ago_clamps_future_timestamps() {
+        use super::time_ago_at;
+
+        let now = Local::now();
+        assert_eq!(time_ago_at(now, now + Duration::hours(5)), "just now");
+    }
 
     fn entry(age_hours: i64, pinned: bool) -> HistoryEntry {
         HistoryEntry {
