@@ -2,6 +2,8 @@
 
 Clipboard history for the COSMIC panel. Copy something, click the icon, it's there.
 
+<img src="assets/popup.png" width="360" alt="ClipManager popup">
+
 ## Features
 
 - Panel icon shows a preview of your last copy — switch to icon-only in Settings
@@ -28,6 +30,8 @@ Images and file copies are **not** recorded, but they're left untouched so pasti
 | `Super+V` | Open the popup (COSMIC custom shortcut) |
 
 Click the gear in the popup footer to change the panel display mode.
+
+<img src="assets/settings.png" width="360" alt="ClipManager settings">
 
 ### Super+V global shortcut
 
