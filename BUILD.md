@@ -24,6 +24,9 @@ cargo build --release
 
 ## Install
 
+For a one-command install, use [`install.sh`](install.sh) as shown in the README.
+The manual steps are below.
+
 ```bash
 pkexec install -m 755 "$PWD/target/release/clipManager" /usr/bin/clipManager
 pkexec install -m 644 "$PWD/clipManager.desktop" /usr/share/applications/clipManager.desktop

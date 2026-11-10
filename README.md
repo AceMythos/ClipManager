@@ -45,20 +45,33 @@ The applet listens for `SIGUSR1` and toggles the popup.
 ## Install
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/AceMythos/ClipManager/main/install.sh | bash
+```
+
+The installer downloads the latest prebuilt release (SHA-256 checked), installs
+`clipManager` to `/usr/bin` and its desktop entry to `/usr/share/applications`,
+and offers to install missing runtime dependencies with `apt`. If there is no
+prebuilt binary for your machine it builds from source instead (Rust required).
+
+Then add it in **COSMIC Settings → Desktop → Panel**.
+
+### Build and install manually
+
+```bash
 cargo build --release
 pkexec install -m 755 "$PWD/target/release/clipManager" /usr/bin/clipManager
 pkexec install -m 644 "$PWD/clipManager.desktop" /usr/share/applications/clipManager.desktop
 ```
 
-Then add it in **COSMIC Settings → Desktop → Panel**.
-
 > Using `pkexec`? It resets the working directory — use absolute paths.
 
 ## Needs
 
-- Rust ([rustup.rs](https://rustup.rs))
+- Rust ([rustup.rs](https://rustup.rs)) — only for building from source
 - `wl-clipboard` 2.2+ (`wl-paste`, `wl-copy`)
 - `libnotify` (`notify-send`)
+
+The one-command installer installs the last two on `apt`-based systems.
 
 ## Notes
 

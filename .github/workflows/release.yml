@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/clipManager dist/
+          cp clipManager.desktop dist/
+          tar -C dist -czf clipManager-x86_64-unknown-linux-gnu.tar.gz clipManager clipManager.desktop
+          sha256sum clipManager-x86_64-unknown-linux-gnu.tar.gz > clipManager-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            clipManager-x86_64-unknown-linux-gnu.tar.gz
+            clipManager-x86_64-unknown-linux-gnu.tar.gz.sha256
