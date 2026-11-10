@@ -44,5 +44,5 @@ picks up the new binary.
 ## Requirements
 
 - Rust toolchain (install via [rustup](https://rustup.rs))
-- `wl-clipboard` (`wl-paste` / `wl-copy`)
+- `wl-clipboard` (`wl-paste`)
 - `libnotify` (`notify-send`)

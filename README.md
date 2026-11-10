@@ -50,10 +50,12 @@ curl -fsSL https://raw.githubusercontent.com/AceMythos/ClipManager/main/install.
 
 The installer downloads the latest prebuilt release (SHA-256 checked), installs
 `clipManager` to `/usr/bin` and its desktop entry to `/usr/share/applications`,
-and offers to install missing runtime dependencies with `apt`. If there is no
-prebuilt binary for your machine it builds from source instead (Rust required).
+and installs missing runtime dependencies with `apt`, `dnf`, or `pacman`. If
+there is no prebuilt binary for your machine it builds from source instead
+(Rust required).
 
-Then add it in **COSMIC Settings → Desktop → Panel**.
+Then add it in **COSMIC Settings → Desktop → Panel**. If ClipManager is not in
+the applet list yet, log out and back in, then check again.
 
 ### Build and install manually
 
@@ -68,10 +70,10 @@ pkexec install -m 644 "$PWD/clipManager.desktop" /usr/share/applications/clipMan
 ## Needs
 
 - Rust ([rustup.rs](https://rustup.rs)) — only for building from source
-- `wl-clipboard` 2.2+ (`wl-paste`, `wl-copy`)
+- `wl-clipboard` 2.2+ (`wl-paste`)
 - `libnotify` (`notify-send`)
 
-The one-command installer installs the last two on `apt`-based systems.
+The one-command installer installs the last two with `apt`, `dnf`, or `pacman`.
 
 ## Notes
 

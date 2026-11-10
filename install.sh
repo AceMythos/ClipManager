@@ -10,24 +10,31 @@ info() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 # Runtime dependencies
-missing=()
-command -v wl-paste >/dev/null 2>&1 || missing+=(wl-clipboard)
-command -v notify-send >/dev/null 2>&1 || missing+=(libnotify-bin)
-if [ "${#missing[@]}" -gt 0 ]; then
+if ! command -v wl-paste >/dev/null 2>&1 || ! command -v notify-send >/dev/null 2>&1; then
     if command -v apt-get >/dev/null 2>&1; then
-        info "Installing ${missing[*]}"
-        sudo apt-get install -y "${missing[@]}"
+        pkgs="wl-clipboard libnotify-bin"
+        info "Installing $pkgs"
+        sudo apt-get install -y $pkgs
+    elif command -v dnf >/dev/null 2>&1; then
+        pkgs="wl-clipboard libnotify"
+        info "Installing $pkgs"
+        sudo dnf install -y $pkgs
+    elif command -v pacman >/dev/null 2>&1; then
+        pkgs="wl-clipboard libnotify"
+        info "Installing $pkgs"
+        sudo pacman -S --needed --noconfirm $pkgs
     else
-        die "missing dependencies: ${missing[*]}"
+        die "missing dependencies: wl-clipboard and libnotify"
     fi
 fi
+
+command -v curl >/dev/null 2>&1 || die "curl is required to download the release."
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 download() {
     local url="$1" dest="$2"
-    command -v curl >/dev/null 2>&1 || return 1
     curl -fsSL --retry 3 -o "$dest" "$url"
 }
 
@@ -62,5 +69,5 @@ $sudo_cmd install -Dm644 "$tmp/clipManager.desktop" "$PREFIX/share/applications/
 
 info "Installed $PREFIX/bin/$BIN"
 printf '\nNext: COSMIC Settings -> Desktop -> Panel -> Add applet -> ClipManager\n'
-printf 'Restart the panel (or log out and back in) if ClipManager was already running.\n'
+printf 'If ClipManager does not show up there, log out and back in and try again.\n'
 printf 'Optional Super+V: add a COSMIC custom shortcut running: pkill -USR1 -x clipManager\n'
